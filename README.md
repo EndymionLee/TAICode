@@ -99,3 +99,12 @@ Skill RAG （使用RAG实现skill），自动索引 `.TAI/skills/` 下的 `.md` 
 | v1.8 | 大改Gate+ifPlan 双层路由 · Planner/TaskSplitter ReAct · Worker 纯执行 · 流式对话    |
 
 ---
+
+## 贡献者
+
+| 贡献者 | 角色 |
+|--------|------|
+| [LiChangJiu777](https://github.com/LiChangJiu777) | 作者 |
+| Claude | AI 协作者 |
+
+---

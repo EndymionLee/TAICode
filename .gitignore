@@ -1,0 +1,38 @@
+# 依赖
+node_modules/
+
+# 构建目录
+build/
+dist-bun/
+
+# 编译产物
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+*.app
+
+# 编译临时文件
+*.swp
+*.swo
+*~
+*.bak
+
+# 项目文档
+ProjectRecord/future-plans/
+ProjectRecord/Main/
+ProjectRecord/process-records/
+
+# TAICode 运行时
+.TAI/
+
+# Claude Code
+.claude/
+
+# 环境变量（含 API Key）
+.env

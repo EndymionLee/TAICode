@@ -1,0 +1,31 @@
+{
+  "name": "taicode",
+  "version": "1.0.0",
+  "description": "LangGraph Task & Memory modules in TypeScript",
+  "type": "module",
+  "bin": { "taicode": "bin/taicode.js" },
+  "scripts": {
+    "start": "npx tsx src/index.ts"
+  },
+  "dependencies": {
+    "@langchain/core": "^0.3.0",
+    "@langchain/langgraph": "^0.2.0",
+    "@langchain/openai": "^0.3.0",
+    "@types/blessed": "^0.1.27",
+    "@types/react": "^19.2.17",
+    "@xenova/transformers": "^2.17.2",
+    "blessed": "^0.1.81",
+    "dotenv": "^16.4.0",
+    "emittery": "^2.0.0",
+    "fast-glob": "^3.3.3",
+    "ink": "^5.2.1",
+    "ink-text-input": "^6.0.0",
+    "node-pty": "^1.1.0",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.5.0"
+  }
+}

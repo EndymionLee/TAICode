@@ -1,0 +1,7 @@
+.claude
+.env
+AGENTS.md
+Word
+node_modules
+*.log
+.TAI

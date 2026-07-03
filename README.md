@@ -104,7 +104,7 @@ Skill RAG （使用RAG实现skill），自动索引 `.TAI/skills/` 下的 `.md` 
 
 | 贡献者 | 角色 |
 |--------|------|
-| [LiChangJiu777](https://github.com/LiChangJiu777) | 作者 |
+| [EndymionLee](https://github.com/EndymionLee) | 作者 |
 | Claude | AI 协作者 |
 
 ---

@@ -377,7 +377,7 @@ export class ContextCompiler {
           cats.CONSTRAINT.push(`• ${text}`);
           break;
         case "STYLE":
-          cats.STYLE.push(`💡 ${text}`);
+          cats.STYLE.push(`- ${text}`);
           break;
         case "KNOWLEDGE":
           cats.KNOWLEDGE.push(text.length > 150 ? text.slice(0, 150) + "..." : text);

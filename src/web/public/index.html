@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<!-- ngrok 免费版跳过拦截页 -->
+<meta http-equiv="ngrok-skip-browser-warning" content="1">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TAICode</title>
+<style>
+  :root { --bg:#f6f8fa; --surface:#fff; --border:#d0d7de; --text:#1f2328; --muted:#656d76; --blue:#0969da; --green:#1a7f37; --yellow:#9a6700; --red:#cf222e; --radius:8px; }
+  body.dark { --bg:#0d1117; --surface:#161b22; --border:#484f58; --text:#c9d1d9; --muted:#8b949e; --blue:#58a6ff; --green:#3fb950; --yellow:#d2991d; --red:#f85149; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); height:100vh; display:flex; }
+  #main { flex:1; display:flex; flex-direction:column; min-width:0; background:var(--surface); margin:12px 12px 12px 0; border-radius:var(--radius); box-shadow:0 1px 3px rgba(0,0,0,.06); overflow:hidden; position:relative; }
+  #messages { flex:1; overflow-y:auto; padding:20px 24px; }
+  #messages .line { padding:3px 0; line-height:1.6; white-space:pre-wrap; word-break:break-word; }
+  .user { color:var(--blue); font-weight:500; }
+  .assistant { color:var(--text); }
+  .thought { color:var(--muted); font-size:13px; }
+  .info { color:var(--muted); font-size:13px; }
+  #status { padding:8px 24px; font-size:13px; color:var(--yellow); border-top:1px solid var(--border); display:none; align-items:center; gap:6px; }
+  #indicators { padding:4px 24px; font-size:12px; color:var(--muted); border-top:1px solid var(--border); }
+  #bottombar { display:flex; padding:12px 20px; border-top:1px solid var(--border); gap:8px; background:var(--surface); }
+  #bottombar input { flex:1; border:1px solid var(--border); border-radius:var(--radius); padding:8px 12px; font-size:15px; color:var(--text); outline:none; background:var(--bg); transition:border .15s; }
+  #bottombar input:focus { border-color:var(--blue); box-shadow:0 0 0 3px rgba(9,105,218,.15); }
+  #bottombar button { background:var(--blue); color:#fff; border:none; padding:8px 20px; border-radius:var(--radius); font-size:14px; font-weight:500; cursor:pointer; transition:background .15s; }
+  #bottombar button:hover { background:#0550ae; }
+
+  #panel { width:240px; border-right:1px solid var(--border); background:var(--surface); margin:12px 0 12px 12px; border-radius:var(--radius); box-shadow:0 1px 3px rgba(0,0,0,.06); display:flex; flex-direction:column; overflow:hidden; transition:width .2s; }
+  #panel.collapsed { width:40px; }
+  #panel.collapsed #files, #panel.collapsed #breadcrumb { display:none; }
+  #panel-toggle { cursor:pointer; font-size:14px; line-height:1; padding:0 4px; }
+  #resize-handle { width:4px; cursor:col-resize; background:transparent; transition:background .2s; flex-shrink:0; }
+  #resize-handle:hover, #resize-handle.active { background:var(--blue); }
+  #editor-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.4); z-index:100; }
+  #editor-overlay.show { display:flex; align-items:center; justify-content:center; }
+  #editor { background:var(--surface); border-radius:var(--radius); width:90vw; max-width:1000px; height:85vh; display:flex; flex-direction:column; box-shadow:0 8px 24px rgba(0,0,0,.15); }
+  #editor-header { padding:10px 16px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; font-size:13px; }
+  #editor-header span { font-weight:600; }
+  #editor-header button { background:transparent; border:1px solid var(--border); padding:4px 12px; border-radius:4px; cursor:pointer; font-size:12px; margin-left:8px; }
+  #editor textarea { flex:1; border:none; padding:20px; font-family:"SF Mono",Consolas,monospace; font-size:15px; line-height:1.6; resize:none; outline:none; color:var(--text); background:var(--surface); }
+  #panel-header { padding:12px 16px; font-size:13px; font-weight:600; color:var(--text); border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; }
+  #panel-header button { background:var(--bg); border:1px solid var(--border); color:var(--muted); padding:3px 10px; border-radius:var(--radius); cursor:pointer; font-size:12px; transition:all .15s; }
+  #panel-header button:hover { color:var(--text); border-color:var(--muted); }
+  #files { flex:1; overflow-y:auto; padding:8px 0; font-size:13px; font-family:"SF Mono",Consolas,monospace; }
+  #files .item { padding:4px 16px; cursor:pointer; transition:background .1s; display:flex; align-items:center; gap:6px; }
+  #files .item:hover { background:var(--bg); }
+  #files .dir { color:var(--blue); }
+  #files .file { color:var(--text); padding-left:28px; }
+
+  .spinner { display:inline-block; width:14px; height:14px; border:2px solid #d0d7de; border-top-color:var(--yellow); border-radius:50%; animation:spin .8s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  .fold { cursor:pointer; user-select:none; margin:4px 0; }
+  .fold-body { display:none; border-left:2px solid var(--border); margin-left:8px; padding-left:12px; }
+  .fold.open .fold-body { display:block; }
+  .fold-title { font-size:13px; color:var(--muted); font-weight:500; }
+  .fold-title:hover { color:var(--text); }
+  #exec-fold .fold-title { color:var(--blue); }
+
+  @media (max-width:768px) {
+    body { flex-direction:column; }
+    #panel { position:fixed; top:0; left:0; width:85vw!important; max-width:320px; height:100vh; margin:0; border-right:1px solid var(--border); border-radius:0; z-index:50; transform:translateX(-100%); transition:transform .25s; box-shadow:none; }
+    #panel.open { transform:translateX(0); box-shadow:4px 0 20px rgba(0,0,0,.15); }
+    #panel-backdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,.3); z-index:49; }
+    #panel-backdrop.show { display:block; }
+    #resize-handle { display:none; }
+    body { height:100dvh; overflow:hidden; }
+    #main { margin:0; border-radius:0; box-shadow:none; flex:1; overflow:hidden; }
+    #messages { padding:40px 16px 14px; font-size:15px; flex:1; overflow-y:auto; }
+    #bottombar { padding:10px 12px 14px; gap:8px; flex-shrink:0; padding-bottom:max(14px, env(safe-area-inset-bottom)); }
+    #bottombar input { font-size:16px; padding:10px 12px; }
+    #bottombar button { padding:10px 18px; font-size:15px; }
+    #menu-btn { display:block!important; }
+    #editor { width:100vw; height:100dvh; max-width:none; border-radius:0; }
+    #editor textarea { font-size:16px; padding:16px; padding-bottom:max(16px, env(safe-area-inset-bottom)); }
+  }
+
+  #menu-btn { display:none; position:absolute; top:8px; left:8px; z-index:10; background:var(--surface); border:1px solid var(--border); border-radius:6px; font-size:18px; cursor:pointer; padding:4px 10px; color:var(--text); }
+
+  ::-webkit-scrollbar { width:6px; }
+  ::-webkit-scrollbar-track { background:transparent; }
+  ::-webkit-scrollbar-thumb { background:#d0d7de; border-radius:3px; }
+</style>
+</head>
+<body>
+  <div id="panel-backdrop" onclick="togglePanel()"></div>
+
+  <div id="panel">
+    <div id="panel-header"><span id="panel-toggle" onclick="document.getElementById('panel').classList.toggle('collapsed')">&laquo;</span><span id="breadcrumb">Files</span><button onclick="document.body.classList.toggle('dark')" style="background:transparent;border:1px solid var(--border);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:12px;color:var(--text)">&#9789;</button></div>
+    <div id="files">Loading...</div>
+  </div>
+
+  <div id="resize-handle"></div>
+
+  <div id="main">
+    <button id="menu-btn" onclick="togglePanel()">&#9776;</button>
+    <div id="messages"></div>
+    <div id="status"><span class="spinner"></span><span id="statustext"></span> <span id="taskstats" style="color:var(--muted)"></span></div>
+    <div id="indicators"></div>
+    <div id="bottombar">
+      <input id="input" placeholder="输入任务或对话..." autofocus>
+      <button id="send">发送</button>
+    </div>
+  </div>
+
+  <div id="editor-overlay" onclick="if(event.target===this)closeEditor()">
+    <div id="editor">
+      <div id="editor-header"><span id="editor-path"></span><div><button id="editor-save" onclick="saveFile()">保存</button><button onclick="closeEditor()">关闭</button></div></div>
+      <textarea id="editor-text" spellcheck="false"></textarea>
+    </div>
+  </div>
+
+<script>
+const msgs = document.getElementById('messages');
+const status = document.getElementById('status');
+const statustext = document.getElementById('statustext');
+const taskstats = document.getElementById('taskstats');
+const indicators = document.getElementById('indicators');
+const files = document.getElementById('files');
+const input = document.getElementById('input');
+
+let ws, autoApprove = false, showLogs = false, lastAssistantLine, currentDir = '.', workspaceRoot = '';
+const isMobile = () => window.innerWidth <= 768;
+
+function scroll() { msgs.scrollTop = msgs.scrollHeight; }
+function addLine(text, cls) { const d = document.createElement('div'); d.className = 'line '+cls; d.textContent = text||' '; msgs.appendChild(d); scroll(); }
+function updateIndicators() { indicators.innerHTML = [autoApprove?'auto 已开启':'', showLogs?'log 已开启':''].filter(Boolean).join(' · ') || ' '; }
+
+function addExecLine(text) {
+  const short = text.length > 80 ? text.slice(0, 80)+'...' : text;
+  let fold = document.getElementById('exec-fold');
+  if (!fold) {
+    fold = document.createElement('div'); fold.id='exec-fold'; fold.className='fold';
+    fold.innerHTML = '<div class="fold-title" onclick="this.parentElement.classList.toggle(\'open\')"><span class="spinner"></span> Working...</div><div class="fold-body"></div>';
+    msgs.appendChild(fold);
+  }
+  const body = fold.querySelector('.fold-body');
+  const l = document.createElement('div'); l.className='line thought'; l.textContent = short;
+  body.appendChild(l); scroll();
+}
+
+function finishExec() {
+  const fold = document.getElementById('exec-fold');
+  if (fold) {
+    const title = fold.querySelector('.fold-title');
+    if (title) title.innerHTML = '&#10003; Done';
+    fold.classList.remove('open');
+  }
+}
+
+let firstConnect = true;
+function connect() {
+  if (!firstConnect) msgs.innerHTML = '';
+  firstConnect = false;
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/ws');
+  ws.onmessage = (e) => {
+    const { type, data } = JSON.parse(e.data);
+    switch (type) {
+      // Chat
+      case 'chat:user': addLine('> '+data.text, 'user'); break;
+      case 'chat:assistant': addLine(data.text, 'assistant'); break;
+      // LLM streaming
+      case 'llm:start':
+        lastAssistantLine = null;
+        const t = document.createElement('div'); t.className='line thought'; t.textContent='Thinking...'; msgs.appendChild(t); scroll();
+        break;
+      case 'llm:token':
+        const th = msgs.lastElementChild;
+        if (th?.classList.contains('thought')) th.remove();
+        if (!lastAssistantLine) { lastAssistantLine = document.createElement('div'); lastAssistantLine.className='line assistant'; msgs.appendChild(lastAssistantLine); }
+        lastAssistantLine.textContent += data.text; scroll();
+        break;
+      case 'llm:done': break;
+      // Phase
+      case 'phase:change': status.style.display = data.phase==='idle'?'none':'flex'; statustext.textContent = {planning:'Planning',running:'Running',validating:'Validating',summarizing:'Summarizing',thinking:'Thinking'}[data.phase]||data.phase; break;
+      // Execution events → 折叠
+      case 'planner:plan': addExecLine('Plan: '+data.taskCount+' tasks, '+data.roots+' roots'); break;
+      case 'bigtask:start': addExecLine('Task '+data.current+'/'+data.total+': '+data.goal); break;
+      case 'dag:start':
+        status.style.display='flex'; statustext.textContent='Running ('+data.taskCount+' tasks)';
+        if (isMobile()) { const p=document.getElementById('panel'); p.classList.add('open'); document.getElementById('panel-backdrop').classList.add('show'); }
+        break;
+      case 'dag:done':
+        status.style.display='none';
+        taskstats.textContent = 'ok '+data.success+'  err '+data.failed+'  skip '+data.skipped;
+        finishExec();
+        if (ws?.readyState===WebSocket.OPEN) ws.send(JSON.stringify({action:'ls', dir:currentDir}));
+        break;
+      case 'chat:assistant':
+        addLine(data.text, 'assistant');
+        finishExec();
+        if (ws?.readyState===WebSocket.OPEN) ws.send(JSON.stringify({action:'ls', dir:currentDir}));
+        break;
+      case 'task:start': addExecLine('[ ] '+data.description); break;
+      case 'task:done': addExecLine('[ok] #'+data.id); if (ws?.readyState===WebSocket.OPEN) ws.send(JSON.stringify({action:'ls', dir:currentDir})); break;
+      case 'task:fail': addExecLine('[err] #'+data.id+' - '+data.error); break;
+      case 'task:progress': break;
+      // File list
+      case 'fileopen':
+        editorPath = data.path;
+        document.getElementById('editor-path').textContent = data.path;
+        document.getElementById('editor-text').value = data.content;
+        document.getElementById('editor-overlay').classList.add('show');
+        document.getElementById('editor-save').style.display = /\.(py|ts|js|tsx|json|txt|md|html|css|yml|yaml|sh|env|gitignore)$/i.test(data.path) ? '' : 'none';
+        break;
+      case 'filesaved':
+        closeEditor();
+        break;
+      case 'filelist':
+        if (data.root) workspaceRoot = data.root.replace(/\\/g, '/').replace(/\/$/, '');
+        const cur = data.dir.replace(/\\/g, '/').replace(/\/$/, '');
+        const parent = cur.split('/').slice(0, -1).join('/') || '/';
+        const atRoot = workspaceRoot && cur.toLowerCase() === workspaceRoot.toLowerCase();
+        const back = !atRoot ? `<div class="item dir" data-path="${parent}">&#8617; ..</div>` : '';
+        files.innerHTML = back + data.items.map(f => f.endsWith('/')
+          ? `<div class="item dir" data-path="${cur}/${f.replace('/','')}">&#128193; ${f.replace('/','')}</div>`
+          : `<div class="item file" data-file="${f}">&#128196; ${f}</div>`).join('');
+        currentDir = cur;
+        document.getElementById('breadcrumb').textContent = currentDir;
+        break;
+    }
+  };
+  ws.onopen = () => { ws.send(JSON.stringify({action:'ls'})); };
+  ws.onclose = () => setTimeout(connect, 2000);
+}
+
+function send() {
+  const text = input.value.trim();
+  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+  if (text === '/auto') { autoApprove = !autoApprove; ws.send(JSON.stringify({action:'auto',value:autoApprove})); }
+  else if (text === '/log') { showLogs = !showLogs; ws.send(JSON.stringify({action:'log',value:showLogs})); }
+  else ws.send(JSON.stringify({text}));
+  input.value = ''; updateIndicators();
+}
+
+input.addEventListener('keydown', (e) => { if (e.key==='Enter') send(); });
+document.getElementById('send').addEventListener('click', send);
+files.addEventListener('click', (e) => {
+  const dir = e.target.closest('.dir');
+  const file = e.target.closest('.file');
+  if (dir && ws?.readyState===WebSocket.OPEN) ws.send(JSON.stringify({action:'ls', dir:dir.dataset.path}));
+  if (file && ws?.readyState===WebSocket.OPEN) {
+    const fname = file.dataset.file;
+    if (fname) ws.send(JSON.stringify({action:'open', path: currentDir + '/' + fname}));
+  }
+});
+
+let editorPath = '';
+function closeEditor() {
+  document.getElementById('editor-overlay').classList.remove('show');
+  if (ws?.readyState===WebSocket.OPEN) ws.send(JSON.stringify({action:'ls', dir:currentDir}));
+}
+function saveFile() {
+  const path = editorPath, content = document.getElementById('editor-text').value;
+  if (path && ws?.readyState===WebSocket.OPEN) ws.send(JSON.stringify({action:'save', path, content}));
+}
+function togglePanel() {
+  const p = document.getElementById('panel');
+  const b = document.getElementById('panel-backdrop');
+  p.classList.toggle('open');
+  b.classList.toggle('show');
+}
+connect();
+
+// 拖拽调整文件面板宽度
+(function(){
+  const panel = document.getElementById('panel');
+  const handle = document.getElementById('resize-handle');
+  let dragging = false, raf = 0;
+  const onStart = (e) => {
+    dragging = true; handle.classList.add('active');
+    document.body.style.cursor = 'col-resize'; document.body.style.userSelect = 'none';
+    e.preventDefault();
+  };
+  handle.addEventListener('mousedown', onStart);
+  handle.addEventListener('touchstart', onStart, {passive:false});
+
+  const onMove = (e) => {
+    if (!dragging || panel.classList.contains('collapsed')) return;
+    const pos = e.touches ? e.touches[0] : e;
+    if (raf) cancelAnimationFrame(raf);
+    raf = requestAnimationFrame(() => {
+      if (isMobile()) panel.style.height = Math.max(100, Math.min(window.innerHeight-200, pos.clientY)) + 'px';
+      else panel.style.width = Math.max(160, Math.min(500, pos.clientX)) + 'px';
+    });
+  };
+  window.addEventListener('mousemove', onMove);
+  window.addEventListener('touchmove', onMove, {passive:false});
+
+  const onEnd = () => {
+    if (!dragging) return;
+    dragging = false; handle.classList.remove('active');
+    document.body.style.cursor = ''; document.body.style.userSelect = '';
+    if (raf) cancelAnimationFrame(raf);
+  };
+  window.addEventListener('mouseup', onEnd);
+  window.addEventListener('touchend', onEnd);
+})();
+</script>
+</body>
+</html>

@@ -66,6 +66,7 @@ export class Session {
   private _lastWasTask = false;
 
   get modelName(): string { return this.chatLLM.modelName; }
+  get shortTermHistory(): string { return this.memory.shortTerm.toText(20); }
 
   async init(): Promise<void> {
     if (this.initialized) return;

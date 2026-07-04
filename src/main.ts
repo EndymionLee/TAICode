@@ -1,5 +1,5 @@
 /**
- * TAICode — Ink TUI
+ * TAICode — TUI (默认) / Web (--web)
  */
 export {};
 
@@ -11,5 +11,16 @@ if (process.platform === "win32") {
   } catch { /* 非致命 */ }
 }
 
-const { startTui } = await import("./tui/launcher.js");
-await startTui();
+const args = process.argv.slice(2);
+const isWeb = args.includes("--web");
+
+if (isWeb) {
+  const { Session } = await import("./runtime/session.js");
+  const session = new Session();
+  await session.init();
+  const { startWeb } = await import("./web/server.js");
+  await startWeb(session);
+} else {
+  const { startTui } = await import("./tui/launcher.js");
+  await startTui();
+}

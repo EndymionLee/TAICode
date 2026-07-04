@@ -11,8 +11,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectDir = path.resolve(__dirname, "..");
 const args = process.argv.slice(2);
 
-// 在 TAICode 项目目录下执行 npx tsx src/main.ts，保持用户 CWD
-const child = spawn("npx", ["tsx", "src/index.ts", ...args], {
+// 在 TAICode 项目目录下执行 npx tsx src/index.ts，保持用户 CWD
+const cmd = `npx tsx src/index.ts ${args.join(" ")}`;
+const child = spawn(cmd, {
   cwd: projectDir,
   stdio: "inherit",
   env: { ...process.env, TAICODE_CWD: process.cwd() },

@@ -87,7 +87,7 @@
   <div id="panel-backdrop" onclick="togglePanel()"></div>
 
   <div id="panel">
-    <div id="panel-header"><span id="panel-toggle" onclick="document.getElementById('panel').classList.toggle('collapsed')">&laquo;</span><span id="breadcrumb">Files</span><button onclick="document.body.classList.toggle('dark')" style="background:transparent;border:1px solid var(--border);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:12px;color:var(--text)">&#9789;</button></div>
+    <div id="panel-header"><span id="panel-toggle" onclick="togglePanel()">&laquo;</span><span id="breadcrumb">Files</span><button onclick="document.body.classList.toggle('dark')" style="background:transparent;border:1px solid var(--border);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:12px;color:var(--text)">&#9789;</button></div>
     <div id="files">Loading...</div>
   </div>
 
@@ -258,9 +258,13 @@ function saveFile() {
 }
 function togglePanel() {
   const p = document.getElementById('panel');
-  const b = document.getElementById('panel-backdrop');
-  p.classList.toggle('open');
-  b.classList.toggle('show');
+  if (isMobile()) {
+    const b = document.getElementById('panel-backdrop');
+    p.classList.toggle('open');
+    b.classList.toggle('show');
+  } else {
+    p.classList.toggle('collapsed');
+  }
 }
 connect();
 

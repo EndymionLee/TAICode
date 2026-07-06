@@ -24,6 +24,20 @@ taicode --web     # Web 模式 → http://localhost:3000
 
 ---
 
+## 界面
+
+#### 终端界面
+
+![终端界面](Img/1.png)
+
+#### web界面
+
+![Web界面](Img/2.png)
+
+---
+
+---
+
 ## 技术栈
 
 TypeScript · OpenAISDK· LangGraph · LangChain · Ink/React · Emittery · Xenova Transformers
@@ -98,15 +112,15 @@ Skill RAG （使用RAG实现skill），自动索引 `.TAI/skills/` 下的 `.md` 
 | v1.6 | Worker 卡死修复 · PermissionManager 安全前缀 · ChatOpenAI HTTP timeout · 三层验证   |
 | v1.7 | 日志改位置 .TAI/logs/ · /log 默认关闭 · spec.json/skills 迁入 .TAI · bootstrap 入口 |
 | v1.8 | 大改Gate+ifPlan 双层路由 · Planner/TaskSplitter ReAct · Worker 纯执行 · 流式对话    |
-| v1.9 | Web 模式: Fastify + WebSocket + 文件面板 + 编辑器 + 黑白主题 + 移动端      |
+| v1.9 | Web 模式: Fastify + WebSocket + 文件面板 + 编辑器 + 黑白主题 + 移动端                  |
 
 ---
 
 ## 贡献者
 
-| 贡献者 | 角色 |
-|--------|------|
-| [EndymionLee](https://github.com/EndymionLee) | 作者 |
-| Claude | AI 协作者 |
+| 贡献者                                     | 角色      |
+| ------------------------------------------ | --------- |
+| [EndymionLee](https://github.com/EndymionLee) | 作者      |
+| Claude                                     | AI 协作者 |
 
 ---

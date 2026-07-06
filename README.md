@@ -1,126 +1,341 @@
 # TAICode
 
-跨考控制寄了，机器人这条路走不通了。三月开始给自己找退路，接触到了 Agent 这个方向，感觉还挺有意思的。
+> An AI Coding Agent built with LangGraph.
 
-毕业设计浪费了不少时间，三个月学Agent学得断断续续的。跟着 gpt 学 api post，RAG、ReAct 范式、Tools、MCP、记忆系统、多 Agent 协作、DAG ，用 Python 边学边写，也做了几个 Demo，感觉还是太浅了。
+TAICode 是一个学习Agent，模仿 Claude Code 的 AI Coding Agent，基于 LangGraph、ReAct 与 DAG Workflow 构建，支持 Memory、MCP、Skills、多 Agent 协同及 TUI / Web 双界面。
 
-就想着做一个系统性的学习项目，Clone 了 CC 的代码。发现它真的太复杂了，硬啃了很久还是啃不下，放弃了，选择用 Python 做一个类似的项目，结果我太菜了，而且学习过程中不断修改框架、一直重构，彻底变成了屎山，Bug 多到已经无法修复，只能放弃了。
+---
 
-最后，决定用 TypeScript 从头开始写个低低低低低低配CC，于是有了这个学习项目。
+## Features
 
-```bash
-npm install -g taicode
-cd 任意目录
-taicode           # TUI 模式
-taicode --web     # Web 模式 → http://localhost:3000
+- 基于 LangGraph 状态机构建 Agent Runtime
+- 双层 LLM 路由（Gate + Planner）
+- ReAct Planner 与 TaskSplitter
+- 四层 Memory（短期、语义、用户画像、规则）
+- Context Compiler（EMA 评分、上下文去噪、动态压缩）
+- Event-driven DAG Scheduler（支持最多 8 个 Worker 并发执行）
+- Skill RAG（本地 Embedding 自动检索）
+- Model Context Protocol（stdio / SSE）
+- 四层 Guard 安全机制
+- React/Ink Terminal UI
+- Fastify + WebSocket Web UI
+
+---
+
+## Demo
+
+### Terminal
+
+![Terminal](Img/1.png)
+
+### Web
+
+![Web](Img/2.png)
+
+---
+
+## Architecture
+
+```text
+                              User
+                                │
+               ┌────────────────┴────────────────┐
+               │                                 │
+             Chat                              Task
+               │                                 │
+               ▼                                 ▼
+        Stream Output                      Gate (LLM)
+                                                 │
+                                  ┌──────────────┴──────────────┐
+                                  │                             │
+                             Simple Task                  Complex Task
+                                  │                             │
+                               Worker                    Planner (ReAct)
+                                                                │
+                                                         TaskSplitter
+                                                                │
+                                                                ▼
+                                                         DAG Scheduler
+                                                                │
+                                                        Multiple Workers
+                                                                │
+                                                            Validator
+                                                                │
+                                                          Final Summary
+
+
+Runtime
+
+EventBus
+├── Memory
+├── MCP
+├── Skills
+├── Sandbox
+└── Telemetry(spanId)
 ```
 
-| 命令      | 作用                                               |
-| --------- | -------------------------------------------------- |
-| `/auto` | 切换自动放行，开启后 shell 危险操作不再弹确认      |
-| `/log`  | 切换文件日志，开启后 `.TAI/logs/` 下写入调试日志 |
-| `/exit` | 退出                                               |
-|           |                                                    |
+---
+
+## Core Components
+
+### Agent Runtime
+
+TAICode 基于 LangGraph 构建 Agent Runtime。
+
+整个系统采用状态机驱动，将聊天、任务规划、任务执行、结果汇总等流程统一建模，使 Agent 生命周期具有良好的可维护性与可扩展性。
 
 ---
 
-## 界面
+### Memory
 
-#### 终端界面
+采用四层记忆系统：
 
-![终端界面](Img/1.png)
+- 短期记忆
+- 语义记忆
+- 用户画像
+- 规则记忆
 
-#### web界面
-
-![Web界面](Img/2.png)
-
----
-
----
-
-## 技术栈
-
-TypeScript · OpenAISDK· LangGraph · LangChain · Ink/React · Emittery · Xenova Transformers
+使用 Xenova `all-MiniLM-L6-v2`（384 维）完成本地向量化，实现长期知识存储、上下文持久化与经验复用。
 
 ---
 
-## 架构
+### Context Compiler
 
-```
-输入
-  → Gate (LLM) ─ chat  → 流式输出
-               ─ task  → ifPlan (LLM) ─ simple → Worker → 汇总
-                                       ─ complex → Planner(ReAct)(项目拆分为大任务) → 队列（TASK调度器）→ Splitter(ReAct)(大任务继续拆成小任务) → DAG → Validator → 汇总
+长任务执行过程中会不断积累上下文。
 
-底层: EventBus 解耦 · Memory(4类记忆) · 类Sandbox(4层Guard) · spanId 可观测
-```
+Context Compiler 负责：
+
+- EMA 评分
+- Context 去噪
+- 动态压缩
+- 历史结果筛选
+
+自动过滤低价值信息，提高长上下文场景下的信息质量。
 
 ---
 
-## 工具
+### Planner
 
-12 个基础工具，Shell 无转义直接 `spawn(exe, args)`，每命令独立进程 + `killTree`。权限三级：safe 直接执行 / warn 需确认 / danger 拒绝。`python`/`pip`/`npm`/`node`/`git` 等安全解释器前缀直接放行。
+复杂任务采用 ReAct 工作流。
 
-`read_file` · `write_file` · `mkdir` · `cp` · `mv` · `rm` · `stat` · `ls` · `find` · `grep` · `sed` · `shell`
+Planner 不直接规划，首先通过：
+
+- ls
+- read_file
+- grep
+
+等工具感知项目状态，再完成任务拆解与执行规划，降低 LLM 幻觉带来的影响。
+
+---
+
+### Scheduler
+
+所有任务都会建模为 DAG。
+
+Scheduler 根据依赖关系自动调度 Worker，仅在依赖满足时触发后续节点，实现任务级并行执行。
+
+特点：
+
+- Dependency Graph
+- Parallel Scheduling
+- Multi Worker
+- Dependency-aware Execution
+
+目前支持最多 8 个 Worker 并发执行。
+
+---
+
+### Worker
+
+Worker 专注执行，不参与规划。
+
+为了保证长任务稳定性，实现四层死循环检测：
+
+- 重复回复检测
+- 重复工具调用检测
+- Snapshot Diff 检测
+- 同类错误检测
+
+同时结合超时机制避免 Worker 假死。
+
+---
+
+## Tool System
+
+内置文件系统与 Shell 工具：
+
+- read_file
+- write_file
+- mkdir
+- cp
+- mv
+- rm
+- stat
+- ls
+- grep
+- find
+- sed
+- shell
+
+Shell 工具采用：
+
+- spawn()
+- killTree()
+
+每条命令独立进程执行。
+
+权限分为三级：
+
+| Level  | Description |
+| ------ | ----------- |
+| safe   | 直接执行    |
+| warn   | 用户确认    |
+| danger | 拒绝执行    |
 
 ---
 
 ## MCP
 
-支持 Model Context Protocol，双传输统一 JSON-RPC 2.0：
+支持 Model Context Protocol。
 
-| 传输  | 说明                                                      |
-| ----- | --------------------------------------------------------- |
-| stdio | spawn 子进程，readline per-line JSON，10s connect         |
-| SSE   | GET /sse 握手 → bracket-counting 流解析 → POST endpoint |
+支持两种传输方式：
 
-工具自动发现 → 注册 → 继承 Sandbox。工具名 `mcp/server/tool` ↔ `mcp_server_tool` (DeepSeek `/` 适配)。
+| Transport | Status    |
+| --------- | --------- |
+| stdio     | Supported |
+| SSE       | Supported |
+
+MCP 工具自动发现、自动注册，并统一采用 JSON-RPC 2.0 通信。
+
+所有 MCP Tool 默认继承 Guard 与 Sandbox 权限体系。
 
 ---
 
 ## Skills
 
-Skill RAG （使用RAG实现skill），自动索引 `.TAI/skills/` 下的 `.md` 技能手册。启动时 SHA-256 增量同步，本地 embedding (Xenova/all-MiniLM-L6-v2, 384 维)，余弦相似度检索。匹配的技能自动注入 Planner prompt。
+Skill 基于 RAG 实现。
+
+启动时自动扫描：
+
+```text
+.TAI/skills/
+```
+
+执行流程：
+
+```text
+Markdown
+
+↓
+
+SHA-256 增量同步
+
+↓
+
+Embedding
+
+↓
+
+Cosine Search
+
+↓
+
+Planner Prompt
+```
+
+匹配到的 Skill 会自动注入 Planner Prompt，无需人工维护长 Prompt。
 
 ---
 
-| 特性                      | 说明                                                      |
-| ------------------------- | --------------------------------------------------------- |
-| **双层 LLM 路由**   | Gate 判断 chat/task，ifPlan 判断 simple/complex，各司其职 |
-| **ReAct 观察**      | Planner/TaskSplitter 先 ls+read_file 看项目现状，再决策   |
-| **Worker 四层保护** | 重复回复·重复工具·无活动·同类错误，120s 超时兜底       |
-| **流式对话**        | 裸模型 stream()，不绑工具，逐 token 输出                  |
-| **文件快照进度**    | mtime/size diff + 工具调用信号，不靠日志 grep             |
-| **全局 ID 空间**    | remapBatch 跨批次 offset，多轮结果不覆盖                  |
-| **Import 自适应**   | 非 stdlib + 非本地 → 第三方，不维护白名单                |
-| **重试四维分类**    | 幻觉不重试·语法错误先修复·超时重试·Sandbox 拒绝不重试  |
-| **Spec Lock**       | 文件白名单 + unexpected_file 检测，防文件漂移             |
-| **可观测性**        | spanId 关联 4 通道 + 一致性断言 + Final Summary 面板      |
-| **安全类沙箱**      | Budget·Path·Command·Audit 四层 Guard，纯增量不改工具   |
-| **Persona 衰减**    | 30 天未提及自动过滤，记忆不膨胀                           |
+## Tech Stack
+
+### Runtime
+
+- TypeScript
+- Node.js
+
+### AI
+
+- LangGraph
+- LangChain
+- OpenAI SDK
+
+### UI
+
+- React
+- Ink
+- Fastify
+- WebSocket
+
+### Embedding
+
+- Xenova Transformers
+- all-MiniLM-L6-v2
 
 ---
 
-## 版本
+## Quick Start
 
-| 版本 | 关键变更                                                                               |
-| ---- | -------------------------------------------------------------------------------------- |
-| v0.3 | LangGraph 状态机 + DAG 调度器 + log                                                    |
-| v0.5 | Worker 四层活动检测 (防止假死)                                                         |
-| v1.0 | Persona decay · Embedding metadata                                                    |
-| v1.5 | remapBatch 全局 ID · Import Validator 重写 · Final Summary · 一致性断言             |
-| v1.6 | Worker 卡死修复 · PermissionManager 安全前缀 · ChatOpenAI HTTP timeout · 三层验证   |
-| v1.7 | 日志改位置 .TAI/logs/ · /log 默认关闭 · spec.json/skills 迁入 .TAI · bootstrap 入口 |
-| v1.8 | 大改Gate+ifPlan 双层路由 · Planner/TaskSplitter ReAct · Worker 纯执行 · 流式对话    |
-| v1.9 | Web 模式: Fastify + WebSocket + 文件面板 + 编辑器 + 黑白主题 + 移动端                  |
+安装：
+
+```bash
+npm install -g taicode
+```
+
+Terminal：
+
+```bash
+taicode
+```
+
+Web：
+
+```bash
+taicode --web
+```
+
+默认地址：
+
+```text
+http://localhost:3000
+```
 
 ---
 
-## 贡献者
+## Commands
 
-| 贡献者                                     | 角色      |
-| ------------------------------------------ | --------- |
-| [EndymionLee](https://github.com/EndymionLee) | 作者      |
-| Claude                                     | AI 协作者 |
+| Command | Description      |
+| ------- | ---------------- |
+| /auto   | 自动放行危险命令 |
+| /log    | 日志开关         |
+| /exit   | 退出             |
 
 ---
+
+## Roadmap
+
+- [X] LangGraph Runtime
+- [X] ReAct Planner
+- [X] Memory System
+- [X] Context Compiler
+- [X] DAG Scheduler
+- [X] MCP
+- [X] Skills
+- [X] Web UI
+- [ ] Multi-Agent Collaboration
+- [ ] Plugin Marketplace
+- [ ] Cloud Memory
+- [ ] Tree Search
+
+---
+
+## License
+
+Apache License 2.0
+
+---
+
+## Author
+
+- **EndymionLee**
+- **Claude**

@@ -7,7 +7,9 @@
     "taicode": "bin/taicode.js"
   },
   "scripts": {
-    "start": "npx tsx src/index.ts"
+    "start": "npx tsx src/index.ts",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
+    "test": "node --import tsx --test tests/"
   },
   "dependencies": {
     "@fastify/static": "^9.1.3",

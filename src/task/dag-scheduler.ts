@@ -5,10 +5,12 @@ import * as os from "os";
 import type { SubTask } from "../core/types.js";
 import { createLogger } from "../core/logger.js";
 import { Semaphore } from "./semaphore.js";
-import { reactWorker, type WorkerResult } from "./worker.js";
+import { reactWorker, estimateWorkerBudgetMs, type WorkerResult } from "./worker.js";
+import { parseWorkerOutput } from "./worker-output.js";
 import { events } from "../core/events.js";
 import { safeJsonParse } from "../core/json-utils.js";
 import { getSandboxInstance } from "../core/tools/registry.js";
+import { extractFileRefKeys } from "../core/file-refs.js";
 import type { ErrorClassification } from "../core/types.js";
 
 const log = createLogger("task:dag");
@@ -17,6 +19,17 @@ const MAX_WORKERS = Math.min(8, os.cpus().length || 4);
 const workerSemaphore = new Semaphore(MAX_WORKERS);
 
 export { MAX_WORKERS, workerSemaphore };
+
+/**
+ * 单任务外层超时 — 按 Worker 内层预算推导 (修复内外超时打架:
+ * 内层 LLM 90s×3 重试最多 270s, 旧外层 120s 必然先杀, 重试全部白做)。
+ * 可用 TAICODE_TASK_TIMEOUT_MS 覆盖。
+ */
+const TASK_TIMEOUT_MS = (() => {
+  const env = Number(process.env.TAICODE_TASK_TIMEOUT_MS);
+  if (Number.isFinite(env) && env > 0) return env;
+  return Math.max(120_000, estimateWorkerBudgetMs());
+})();
 
 /** 找出所有依赖已满足的待执行任务 */
 function findReadyTasks(
@@ -151,12 +164,31 @@ export class DAGScheduler {
       }
       events.task.start(task.id, task.description);
       await workerSemaphore.acquire();
+      // 外层超时不再 reject (旧实现一次超时直接击穿 execute 主循环, 整图崩溃):
+      // 置 aborted 标记 → Worker 在步边界自行退出; race 解析为标准超时失败结果,
+      // 走下方统一的错误分类/重试通道。
+      let timedOut = false;
       try {
         return await Promise.race([
-          reactWorker(task, workerId),
-          new Promise<WorkerResult>((_, reject) =>
-            setTimeout(() => reject(new Error("任务超时(120s)")), 120_000)
-          ),
+          reactWorker(task, workerId, { shouldAbort: () => timedOut }),
+          new Promise<WorkerResult>((resolve) => {
+            const timer = setTimeout(() => {
+              timedOut = true;
+              log.warn(`任务 #${task.id} 外层超时 (${TASK_TIMEOUT_MS / 1000}s), 标记中止`);
+              resolve({
+                taskId: task.id,
+                result: parseWorkerOutput(JSON.stringify({
+                  status: "failed",
+                  summary: `任务超时(${TASK_TIMEOUT_MS / 1000}s)`,
+                  created: [], deleted: [], modified: [],
+                  error: "任务超时",
+                }), task.description, task.id),
+                logs: [],
+                error: `任务超时(${TASK_TIMEOUT_MS / 1000}s)`,
+              });
+            }, TASK_TIMEOUT_MS);
+            timer.unref?.();
+          }),
         ]);
       } finally { workerSemaphore.release(); }
     };
@@ -190,21 +222,20 @@ export class DAGScheduler {
     const MAX_RETRIES = 2;
 
     // 文件写锁：同文件同时只有一个 Worker 在写
+    // (unicode 健壮提取: 中文文件名/多级扩展名/路径 basename 均可命中)
     const fileLocks = new Set<string>();
 
     function lockFiles(task: SubTask): boolean {
-      // 从任务描述中提取文件名
-      const files = task.description.match(/([a-zA-Z0-9_-]+\.[a-z]{1,6})/gi) ?? [];
+      const files = extractFileRefKeys(task.description);
       for (const f of files) {
-        if (fileLocks.has(f.toLowerCase())) return false; // 文件被锁
+        if (fileLocks.has(f)) return false; // 文件被锁
       }
-      for (const f of files) fileLocks.add(f.toLowerCase());
+      for (const f of files) fileLocks.add(f);
       return true;
     }
 
     function unlockFiles(task: SubTask): void {
-      const files = task.description.match(/([a-zA-Z0-9_-]+\.[a-z]{1,6})/gi) ?? [];
-      for (const f of files) fileLocks.delete(f.toLowerCase());
+      for (const f of extractFileRefKeys(task.description)) fileLocks.delete(f);
     }
 
     while (true) {

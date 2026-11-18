@@ -16,6 +16,7 @@ import { toolsList, loadMCPTools, stopMCP } from "../core/tools/registry.js";
 import { events } from "../core/events.js";
 import { TASK_GATE_PROMPT } from "../task/prompts.js";
 import { createLogger } from "../core/logger.js";
+import { extractFileRefs } from "../core/file-refs.js";
 
 const log = createLogger("runtime");
 const CWD = process.env.TAICODE_CWD ?? process.cwd();
@@ -118,6 +119,10 @@ export class Session {
       events.chat.assistant(response);
       events.task.result(response, Date.now() - startTime);
       this._lastWasTask = true;
+      // 任务回合也进记忆 — 旧代码任务路径完全绕过 memory.process, 任务对话不留痕;
+      // 工程事实 (技术栈/布局/结果) 落跨会话项目记忆, 后续"继续/改进"类请求可检索
+      void this.memory.process(userInput, response).catch(() => {});
+      this.memory.recordTaskOutcome(userInput, response, extractFileRefs(response));
       this.turnCount++;
       return response;
     }

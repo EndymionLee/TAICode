@@ -9,13 +9,22 @@ const log = createLogger("llm:embed");
 let _localEmbedder: any = null;
 let _localEmbedderLoading: Promise<any> | null = null;
 
+/**
+ * 嵌入模型可配 — 中文场景推荐 TAICODE_EMBED_MODEL=Xenova/bge-small-zh-v1.5,
+ * 默认 all-MiniLM-L6-v2 (英文为主)。换模型后语义库/技能库按 _meta.model 自动重建。
+ */
+export function embedModelName(): string {
+  return process.env.TAICODE_EMBED_MODEL ?? "Xenova/all-MiniLM-L6-v2";
+}
+
 async function getLocalEmbedder(): Promise<any> {
   if (_localEmbedder) return _localEmbedder;
   if (_localEmbedderLoading) return _localEmbedderLoading;
+  const model = embedModelName();
   _localEmbedderLoading = (async () => {
     try {
-      log.info("加载本地嵌入模型 Xenova/all-MiniLM-L6-v2 (~80MB)...");
-      _localEmbedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+      log.info(`加载本地嵌入模型 ${model}...`);
+      _localEmbedder = await pipeline("feature-extraction", model);
       log.info("本地嵌入模型加载完成");
       return _localEmbedder;
     } catch (e) {

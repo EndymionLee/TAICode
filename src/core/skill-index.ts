@@ -8,6 +8,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
 import { createLogger } from "./logger.js";
+import { embedModelName } from "./llm/embed.js";
 
 const log = createLogger("skill-index");
 
@@ -32,7 +33,8 @@ interface SkillVectors {
   [filename: string]: number[] | any;
 }
 
-const EMBED_META = { model: "all-MiniLM-L6-v2", dimension: 384 };
+// 嵌入元数据 — 模型名实时读取 (TAICODE_EMBED_MODEL 换模型时按 _meta.model 重建索引)
+const EMBED_META = { get model() { return embedModelName(); }, dimension: 384 };
 
 interface SkillEntry {
   name: string;
@@ -60,12 +62,13 @@ export async function syncSkillIndex(): Promise<void> {
   ensureDir(INDEX_DIR);
   const meta = readJson<SkillMeta>(META_FILE, {});
   const vectors = readJson<SkillVectors>(VECTORS_FILE, {});
-  // 维度兼容检查
-  if (vectors._meta && vectors._meta.dimension !== EMBED_META.dimension) {
-    log.warn(`向量维度不匹配 (存储=${vectors._meta.dimension}, 当前=${EMBED_META.dimension})，清空重建`);
+  // 兼容检查 — 维度或模型任一变化即清空重建 (换 TAICODE_EMBED_MODEL 后旧向量不可比)
+  const storedMeta = vectors._meta;
+  if (storedMeta && (storedMeta.dimension !== EMBED_META.dimension || storedMeta.model !== EMBED_META.model)) {
+    log.warn(`嵌入元数据不匹配 (存储=${storedMeta.model}/${storedMeta.dimension}, 当前=${EMBED_META.model}/${EMBED_META.dimension})，清空重建`);
     for (const k of Object.keys(vectors)) { if (k !== "_meta") delete vectors[k]; }
   }
-  vectors._meta = { ...EMBED_META, updated: new Date().toISOString() };
+  vectors._meta = { model: EMBED_META.model, dimension: EMBED_META.dimension, updated: new Date().toISOString() };
 
   // 扫描当前文件
   const currentFiles = fs.readdirSync(SKILLS_DIR).filter((f) => f.endsWith(".md"));

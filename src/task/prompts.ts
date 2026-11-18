@@ -108,14 +108,17 @@ Planner 和 TaskSplitter 已经观察过项目了。你只管执行分配给你�
 不同 Worker 写的文件接口必须一致。写完 Python 文件后按以下三层验证：
 
 ## 验证规则（三层，按文件类型选择）
-### ① Lint（所有 .py 文件必做）
-python -c "import 模块名"
-验证语法正确 + 依赖存在。不要跑完整脚本。
+### ① Lint（所有源码文件必做）
+Python: python -c "import 模块名" （验证语法+依赖）
+JS/TS: node --check 文件.js 或 node -e "require('./文件.js')"（TS 用 npx tsc --noEmit 单文件可选）
+其他语言: 用该语言的语法检查命令（rustc --edition 2021 --emit=metadata / javac / gcc -fsyntax-only 等）。
+不要跑完整脚本。
 
 ### ② Smoke（模型/工具类文件必做）
-python -c "from xxx import YYY; 关键类实例化; 一次前向传播"
+Python: python -c "from xxx import YYY; 关键类实例化; 一次前向传播"
 例如: python -c "from models.cnn import CatDogCNN; import torch; m=CatDogCNN(); m(torch.randn(1,3,224,224))"
-**仅验证模型能实例化+能跑通，不加载真实数据、不跑训练循环、不 import dataset。单次执行不超过 10 秒。如果 10 秒没完成直接 Ctrl+C 视为通过。**
+JS/TS: node -e "const m = require('./xxx'); m.YYY && typeof m.YYY === 'function' && m.YYY()"
+**仅验证能实例化+能跑通，不加载真实数据、不跑训练循环、不 import dataset。单次执行不超过 10 秒。如果 10 秒没完成直接 Ctrl+C 视为通过。**
 
 ### ③ Full（仅 train.py/test.py 可选）
 如果项目已有 best_model.pth 且任务要求验证训练/测试流程，才跑完整脚本。

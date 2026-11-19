@@ -56,6 +56,9 @@ const TaskAnnotation = Annotation.Root({
   userInput: Annotation<string>({ reducer: (_c, n) => n, default: () => "" }),
   needDecompose: Annotation<boolean>({ reducer: (_c, n) => n, default: () => false }),
   tasks: Annotation<SubTask[]>({ reducer: (_c, n) => n, default: () => [] }),
+  // 结算台账 — 跨批次累积已结算任务(带 status/writes)。
+  // tasks 字段会被 taskSplitter 按批次整体替换, 不能承载历史 → 计数/一致性断言以 allTasks 为准
+  allTasks: Annotation<SubTask[]>({ reducer: (_c, n) => n, default: () => [] }),
   dependencies: Annotation<Record<string, number[]>>({ reducer: (_c, n) => n, default: () => ({}) }),
   completedTasks: Annotation<number[]>({ reducer: (_c, n) => n, default: () => [] }),
   taskResults: Annotation<Record<number, string>>({ reducer: (_c, n) => n, default: () => ({}) }),
@@ -84,9 +87,9 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
   const taskResultCount = Object.keys(state.taskResults).length;
   const fileCount = Object.keys(state.completedFiles).length;
   log.info(`main_agent 进入: dagCompleted=${state.dagCompleted}, taskResults=${taskResultCount}, files=${fileCount}, needDecompose=${state.needDecompose}, finalAnswer.length=${state.finalAnswer.length}`);
-  const successN = state.tasks.filter(t=>t.status==="completed").length;
-  const failN = state.tasks.filter(t=>t.status==="failed").length;
-  const skipN = state.tasks.filter(t=>t.status==="pending").length;
+  const successN = state.allTasks.filter(t=>t.status==="completed").length;
+  const failN = state.allTasks.filter(t=>t.status==="failed").length;
+  const skipN = state.allTasks.filter(t=>t.status==="pending").length;
   const logCount = Object.keys(state.taskLogs).filter(k => Number(k) >= 0).length; // 排除 validator 哨兵
   log.info(`  任务明细: 成功=${successN} 失败=${failN} 跳过=${skipN}`);
   log.info(`  状态一致性: results=${taskResultCount} logs=${logCount} completed=${state.completedTasks.length} total=${successN+failN+skipN}`);
@@ -94,7 +97,7 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
   // 一致性断言 — 含差集定位
   const resultIds = new Set(Object.keys(state.taskResults).map(Number));
   const logIds = new Set(Object.keys(state.taskLogs).map(Number).filter(id => id >= 0)); // 排除 validator 哨兵 -1
-  const taskIds = new Set(state.tasks.map(t => t.id));
+  const taskIds = new Set(state.allTasks.map(t => t.id));
   const consistent = taskIds.size === resultIds.size && logIds.size >= resultIds.size;
 
   if (taskIds.size !== resultIds.size) {
@@ -111,7 +114,7 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
   const dagStart = (state as any)._dagStartMs || 0;
   const duration = dagStart ? ((Date.now() - dagStart) / 1000).toFixed(1) + "s" : "N/A";
   log.info("══════════ DAG FINAL STATE ══════════");
-  log.info(`  Tasks:       ${state.tasks.length}`);
+  log.info(`  Tasks:       ${state.allTasks.length}`);
   log.info(`  Results:     ${taskResultCount}`);
   log.info(`  Logs:        ${logCount}`);
   log.info(`  Completed:   ${state.completedTasks.length}`);
@@ -143,7 +146,7 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
     events.phase.summarizing();
 
     // 收集失败任务
-    const failedTasks = state.tasks.filter((t) => t.status === "failed");
+    const failedTasks = state.allTasks.filter((t) => t.status === "failed");
     const failedNote = failedTasks.length > 0
       ? "\n\n[失败任务]\n" + failedTasks.map((t) => `- #${t.id} ${t.description.slice(0, 80)}: 执行失败，以下成功任务的 summary 中提及此文件不代表已创建`).join("\n")
       : "";
@@ -153,7 +156,7 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
     const entries = Object.entries(state.taskResults);
 
     for (const [id, result] of entries) {
-      const task = state.tasks.find((t) => t.id === Number(id));
+      const task = state.allTasks.find((t) => t.id === Number(id));
       const label = task ? task.description : `任务${id}`;
       let parsed: any = null;
       try { parsed = JSON.parse(result); } catch { /* text */ }
@@ -187,7 +190,7 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
     const seen = new Set<string>();
     const deduped: string[] = [];
     for (const [id] of entries) {
-      const task = state.tasks.find((t) => t.id === Number(id));
+      const task = state.allTasks.find((t) => t.id === Number(id));
       const files = (() => { try { const j = JSON.parse(state.taskResults[Number(id)]); return (j.created ?? []).concat(j.modified ?? []); } catch { return []; } })();
       const keys: string[] = files.length > 0 ? files.map((f: string) => f.toLowerCase().replace(/\\/g, "/")) : [`_notask_${id}`];
       const latestKeys = keys.map((k: string) => fileVersion.get(k)?.id).filter((v): v is string => !!v);
@@ -199,7 +202,7 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
     const summaries = deduped.join("\n\n") || "(无结果)";
 
     // 统计信息
-    const allTasks = state.tasks;
+    const allTasks = state.allTasks;
     const successCount = allTasks.filter((t) => t.status === "completed").length;
     const failCount = allTasks.filter((t) => t.status === "failed").length;
     const skipCount = allTasks.filter((t) => t.status === "pending").length;
@@ -543,7 +546,9 @@ async function dagSchedulerNode(state: TaskState): Promise<Partial<TaskState>> {
   log.info(`DAG 合并: +${batch.completed.length} → results=${Object.keys(allTaskResults).length} files=${Object.keys(completedFiles).length}`);
 
   return {
-    tasks: [...state.tasks, ...batch.tasks], completedTasks: allCompleted,
+    // tasks=本批次已结算副本(供 router/后续节点读当批); allTasks=全批次台账(计数/一致性)
+    tasks: batch.tasks, allTasks: [...state.allTasks, ...batch.tasks],
+    completedTasks: allCompleted,
     taskResults: allTaskResults, taskLogs: allTaskLogs,
     dagCompleted: true, needDecompose: false,
     completedFiles, runtimeState: validatingState,
@@ -556,7 +561,7 @@ async function validatorNode(state: TaskState): Promise<Partial<TaskState>> {
   const nextIdx = state.bigTaskIndex + 1;
   log.info(`validator: 大任务 ${nextIdx}/${state.bigTasks.length} 完成`);
 
-  const rootTask = state.tasks.find((t) => t.writes?.some((w) => w.endsWith("/")));
+  const rootTask = state.allTasks.find((t) => t.writes?.some((w) => w.endsWith("/")));
   const projectDir = rootTask?.writes?.find((w) => w.endsWith("/")) ?? ".";
   const maxRetries = 3;
 
@@ -564,7 +569,7 @@ async function validatorNode(state: TaskState): Promise<Partial<TaskState>> {
   let totalFixes = 0;
 
   for (let round = 1; round <= maxRetries; round++) {
-    const report = await validateProject(state.tasks, projectDir);
+    const report = await validateProject(state.allTasks, projectDir);
     if (report.allClean) {
       if (round === 1) {
         log.info(`验证通过: ${projectDir} 项目结构完整`);
@@ -702,7 +707,7 @@ export async function runTask(userInput: string, shortTermContext?: string): Pro
     taskLogs: {} as Record<number, string[]>,
     finalAnswer: "", dagCompleted: false, loopCount: 0,
     _dagStartMs: Date.now(),
-    bigTaskIndex: 0, bigTasks: [] as SubTask[],
+    bigTaskIndex: 0, bigTasks: [] as SubTask[], allTasks: [] as SubTask[],
     workspace: process.env.TAICODE_CWD ?? process.cwd(),
     spec: [] as string[], specFiles: [] as string[], completedFiles: {} as Record<string, FileState>,
     runtimeState: RuntimeState.IDLE,

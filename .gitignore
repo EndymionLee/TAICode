@@ -36,3 +36,4 @@ ProjectRecord/process-records/
 
 # 环境变量（含 API Key）
 .env
+.e2e/

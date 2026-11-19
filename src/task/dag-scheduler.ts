@@ -269,6 +269,27 @@ export class DAGScheduler {
       const ready = findReadyTasks(tasks, dependencies, completed);
       for (const task of ready) {
         if (running.has(task.id)) continue;
+
+        // P2-2: 依赖已终态失败 → 下游直接 skip-with-reason, 不执行注定失败的任务
+        // (blocked_on 契约字段一并记录在结果里; Validator/轻量重规划可据此补救)
+        const depIds0 = dependencies[String(task.id)] ?? [];
+        const failedDep = depIds0.map((d) => tasks.find((t) => t.id === d)).find((t) => t?.status === "failed");
+        if (failedDep) {
+          task.status = "failed";
+          task.result = JSON.stringify({
+            status: "failed",
+            summary: `前置任务 #${failedDep.id} 已终态失败, 跳过执行 (blocked_on: [${failedDep.id}])`,
+            created: [], deleted: [], modified: [],
+            blocked_on: [failedDep.id], confidence: 1,
+            error: "前置失败跳过",
+          });
+          completed.add(task.id);
+          taskResults[task.id] = task.result;
+          log.warn(`任务 #${task.id} 跳过: 前置 #${failedDep.id} 终态失败`);
+          events.task.fail(task.id, `前置 #${failedDep.id} 失败, 跳过`);
+          continue;
+        }
+
         if (!lockFiles(task)) continue; // 文件被占用，等下一轮
         const r = retries.get(task.id) ?? 0;
         if (r >= MAX_RETRIES) {

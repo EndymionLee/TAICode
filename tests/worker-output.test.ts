@@ -14,6 +14,19 @@ test("合法 JSON: 字段补全 + task_id 注入 (缺 status 保守落 failed)",
   assert.equal(out.error, null);
 });
 
+test("P2-2 契约: blocked_on/confidence 自动补全 (驼峰容错+非法值回落)", () => {
+  const out = JSON.parse(parseWorkerOutput('{"summary":"ok","blockedOn":[3],"confidence":"0.9"}'));
+  assert.deepEqual(out.blocked_on, [3]);
+  assert.equal(out.confidence, 0.9);
+
+  const out2 = JSON.parse(parseWorkerOutput('{"summary":"ok"}'));
+  assert.equal(out2.blocked_on, null);
+  assert.equal(out2.confidence, 0.5);
+
+  const out3 = JSON.parse(parseWorkerOutput('{"summary":"ok","confidence":"高"}'));
+  assert.equal(out3.confidence, 0.5); // 非法值回落
+});
+
 test("合法 JSON: 显式 status 原样保留", () => {
   const out = JSON.parse(parseWorkerOutput('{"status":"success","summary":"ok","created":[]}', "t", 1));
   assert.equal(out.status, "success");

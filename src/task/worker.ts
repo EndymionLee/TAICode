@@ -24,6 +24,7 @@ import { extractFileRefs } from "../core/file-refs.js";
 import { parseWorkerOutput } from "./worker-output.js";
 import { recordAIMessage } from "../core/llm/cache-telemetry.js";
 import { quickLint } from "./quick-lint.js";
+import { truncateToolResult, foldMessages } from "./context-fold.js";
 
 export { parseWorkerOutput } from "./worker-output.js";
 
@@ -206,6 +207,13 @@ export async function reactWorker(
       workerLog.info(`步数自动续期 +15 → ${maxSteps}`);
     }
 
+    // P2-3 上下文预算: 消息超限折叠中段旧工具结果 (保持追加结构, 不删消息)
+    if (messages.length > 40) {
+      const folded = foldMessages(messages);
+      messages.length = 0;
+      messages.push(...folded);
+    }
+
     // 每步一个 span — 关联本步内所有日志/工具调用
     newSpan(trace, `step-${step}`);
     events.task.progress(tid, step, step === 0 ? "思考中" : `第${step}步`);
@@ -345,7 +353,7 @@ export async function reactWorker(
               sameErrorCount = 1;
             }
           }
-          messages.push(new ToolMessage({ content: result, tool_call_id: tc.id!, name: toolName }));
+          messages.push(new ToolMessage({ content: truncateToolResult(result), tool_call_id: tc.id!, name: toolName }));
         } else {
           logs.push(`[Worker-${workerId}] 未知工具: ${toolName}`);
           messages.push(new ToolMessage({ content: `未知工具: ${toolName}`, tool_call_id: tc.id!, name: toolName }));

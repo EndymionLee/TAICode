@@ -73,6 +73,8 @@ function isArticleRequest(input: string): boolean {
 export class Session {
   private chatLLM = createLLMClient({ temperature: 0.7 });
   private summaryLLM = createLLMClient({ temperature: 0 });
+  /** Gate 分类专用 — LLM_GATE_MODEL 可配便宜档 (缺省回落主模型) */
+  private gateLLM = createLLMClient({ model: process.env.LLM_GATE_MODEL || undefined, temperature: 0 });
   private memory!: MemorySystem;
   private turnCount = 0;
   private initialized = false;
@@ -84,7 +86,7 @@ export class Session {
   async init(): Promise<void> {
     if (this.initialized) return;
     log.info("══════════════ TAICode 启动 ══════════════");
-    log.info(`模型: ${this.chatLLM.modelName} · CWD: ${process.cwd()}`);
+    log.info(`模型: ${this.chatLLM.modelName} · Gate: ${this.gateLLM.modelName}${this.gateLLM.modelName !== this.chatLLM.modelName ? " (分级)" : ""} · CWD: ${process.cwd()}`);
     const embedFn = async (text: string): Promise<number[] | null> => {
       try { const r = await this.summaryLLM.embed(text); return r?.[0]?.length > 0 ? r[0] : null; }
       catch { return null; }
@@ -114,8 +116,8 @@ export class Session {
 
     let response = "";
 
-    // LLM 一次性三分类：chat / simple_task / complex_task
-    const gateResult = await this.chatLLM.chat(
+    // LLM 一次性三分类：chat / simple_task / complex_task (分级模型, 省主档调用)
+    const gateResult = await this.gateLLM.chat(
       [{ role: "user", content: TASK_GATE_PROMPT.replace("{userInput}", userInput).replace("{history}", context) } as any],
       { temperature: 0 }
     );

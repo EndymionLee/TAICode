@@ -15,6 +15,9 @@ export interface WorkerOutput {
   read: string[];
   error: string | null;
   task_id?: number;
+  /** P2-2 契约扩展 — 供调度决策, 不约束模型输出 (缺省自动补全) */
+  blocked_on?: number[] | null;   // 声明被哪个前置任务阻塞
+  confidence?: number;            // 0-1 自评把握
   [key: string]: unknown;
 }
 
@@ -69,6 +72,9 @@ export function parseWorkerOutput(result: string, taskDesc?: string, taskId?: nu
   parsed.modified = parsed.modified || [];
   parsed.read = parsed.read || [];
   parsed.error = parsed.error || null;
+  // P2-2: 契约字段补全 (blockedOn/blockOn 驼峰容错; confidence 非法值回落 0.5)
+  parsed.blocked_on = parsed.blocked_on ?? (parsed as any).blockedOn ?? (parsed as any).blockOn ?? null;
+  parsed.confidence = Number.isFinite(Number(parsed.confidence)) ? Number(parsed.confidence) : 0.5;
 
   // 硬截断 summary
   if (summary.length > 120) {

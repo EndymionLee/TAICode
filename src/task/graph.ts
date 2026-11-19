@@ -27,6 +27,8 @@ import * as path from "path";
 
 const log = createLogger("task:graph");
 const llm = createLLMClient({ temperature: 0 });
+/** ifPlan 分类专用 — LLM_GATE_MODEL 可配便宜档 (缺省回落主模型) */
+const gateLlm = createLLMClient({ model: process.env.LLM_GATE_MODEL || undefined, temperature: 0 });
 const dagScheduler = new DAGScheduler();
 
 // ============================================================================
@@ -275,8 +277,8 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
 async function ifPlan(state: TaskState): Promise<Partial<TaskState>> {
   const history = (state as any)._shortTermContext || "";
 
-  log.info(`if_plan: LLM 判断复杂度`);
-  const response = await llm.chat(
+  log.info(`if_plan: LLM 判断复杂度 (模型: ${gateLlm.modelName})`);
+  const response = await gateLlm.chat(
     [new HumanMessage(IF_PLAN_PROMPT.replace("{userInput}", state.userInput).replace("{history}", history))],
     { temperature: 0 }
   );
@@ -315,11 +317,24 @@ async function planner(state: TaskState): Promise<Partial<TaskState>> {
     const obsNote = obs0.note ?? "";
     if (obsNote) log.info(`planner: 观察注入 (${obs0.entries}项, 指纹${obs0.fingerprint})`);
 
+    // ── P2-4 spec 会话级复用: 同指纹工作区注入上次规格参考 (可沿用可改, 不约束) ──
+    let specReuseNote = "";
+    try {
+      const cachePath = path.join(wsDir0, ".TAI", "spec-cache.json");
+      if (fs.existsSync(cachePath) && obs0.fingerprint) {
+        const cached = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
+        if (cached.fingerprint === obs0.fingerprint && cached.spec && Object.keys(cached.spec).length > 0) {
+          specReuseNote = `\n\n[上次同指纹工作区的规格参考 — 结构未变, 可直接沿用或按新需求修改, 自行判断]\n\`\`\`json\n${JSON.stringify({ spec: cached.spec, contract: cached.contract ?? {} }, null, 2)}\n\`\`\``;
+          log.info(`planner: spec 会话级复用命中 (指纹${obs0.fingerprint})`);
+        }
+      }
+    } catch { /* 缓存损坏走常规 */ }
+
     const response = await reactAgent(
       obsNote
         ? "你是项目规划专家。工作区现状已给出, 直接输出 JSON。"
         : "你是项目规划专家。用 ls/read_file 观察项目，再输出 JSON。",
-      prompt + obsNote,
+      prompt + obsNote + specReuseNote,
       obsNote ? 3 : 8,
     );
     const json = extractJson(response);
@@ -347,6 +362,15 @@ async function planner(state: TaskState): Promise<Partial<TaskState>> {
         const specPath = path.join(taiDir, "spec.json");
         fs.writeFileSync(specPath, JSON.stringify({ spec: parsed.spec ?? {}, contract: parsed.contract ?? {}, files: parsed.files ?? [], workspace: ws }, null, 2), "utf-8");
         log.info(`spec.json 已落盘: ${specPath}`);
+        // P2-4: 指纹关联的规格缓存 (下次同指纹工作区注入参考)
+        if (obs0.fingerprint) {
+          try {
+            fs.writeFileSync(path.join(taiDir, "spec-cache.json"), JSON.stringify({
+              fingerprint: obs0.fingerprint, spec: parsed.spec ?? {}, contract: parsed.contract ?? {},
+              files: parsed.files ?? [], userInput: state.userInput.slice(0, 100), ts: Date.now(),
+            }, null, 2), "utf-8");
+          } catch { /* ignore */ }
+        }
       } catch { /* ignore */ }
       const specFiles = parsed.files || [];
       if (specFiles.length > 0) log.info(`specFiles: ${specFiles.length} 个文件 → ${specFiles.slice(0, 10).join(", ")}`);
@@ -574,6 +598,21 @@ async function dagSchedulerNode(state: TaskState): Promise<Partial<TaskState>> {
   const allTaskLogs = { ...state.taskLogs, ...batch.logs };
   const allCompleted = [...state.completedTasks, ...batch.completed];
 
+  // P2-4 补: 轮末回写指纹 — planner 存的是轮初指纹, 任务执行后文件已变,
+  // 下轮初观察必然对不上; 用轮末状态刷新 spec-cache.fingerprint 才能命中复用
+  try {
+    const wsEnd = state.workspace || process.env.TAICODE_CWD || process.cwd();
+    const obsEnd = buildObservation(wsEnd);
+    const spCache = path.join(wsEnd, ".TAI", "spec-cache.json");
+    if (fs.existsSync(spCache) && obsEnd.fingerprint) {
+      const j = JSON.parse(fs.readFileSync(spCache, "utf-8"));
+      j.fingerprint = obsEnd.fingerprint;
+      j.ts = Date.now();
+      fs.writeFileSync(spCache, JSON.stringify(j, null, 2), "utf-8");
+      log.info(`spec-cache 指纹回写(轮末): ${obsEnd.fingerprint}`);
+    }
+  } catch { /* ignore */ }
+
   log.info(`DAG 合并: +${batch.completed.length} → results=${Object.keys(allTaskResults).length} files=${Object.keys(completedFiles).length}`);
 
   return {
@@ -622,6 +661,40 @@ async function validatorNode(state: TaskState): Promise<Partial<TaskState>> {
     for (const issue of report.issues) {
       log.warn(`  [${issue.type}] ${issue.message}`);
       validationLogs.push(`[验证] [${issue.type}] ${issue.message}`);
+    }
+
+    // P2-1 轻量局部重规划 — autoFix 治不了的 missing_import (缺本地模块文件):
+    // 生成单文件修复任务直接执行, 不整批回炉 TaskSplitter (结构性问题仍走大循环)
+    const missingImports = report.issues.filter((i) => i.type === "missing_import");
+    if (round === 1 && missingImports.length > 0 && missingImports.length <= 3) {
+      const baseId = Math.max(0, ...state.allTasks.map((t) => t.id));
+      const fixTasks: SubTask[] = missingImports.map((iss, i) => ({
+        id: baseId + 1 + i,
+        description: `修复任务: Validator 发现 ${iss.message.slice(0, 160)}。请创建该缺失的文件/模块, 做满足引用方的最小实现 (只修复, 不扩展功能), 完成后输出 JSON`,
+        status: "pending" as const, result: "", contract: state.contract,
+      }));
+      log.info(`validator: 轻量重规划 → ${fixTasks.length} 个修复任务直接执行`);
+      validationLogs.push(`[重规划] ${fixTasks.length} 个 missing_import → 修复任务 #${fixTasks.map((t) => t.id).join(",#")}`);
+      const sharedSpecFix = Object.keys(state.spec ?? {}).length > 0
+        ? "\n\n## 项目规格 (全 Worker 共享, 必须遵守)\n```json\n" + JSON.stringify({ spec: state.spec, ...(Object.keys(state.contract ?? {}).length ? { contract: state.contract } : {}) }, null, 2) + "\n```"
+        : "";
+      try {
+        const fr = await dagScheduler.execute(fixTasks, {}, { sharedSpec: sharedSpecFix });
+        const newResults = { ...state.taskResults };
+        const newLogs = { ...state.taskLogs };
+        for (const [k, v] of Object.entries(fr.taskResults)) newResults[Number(k)] = v;
+        for (const [k, v] of Object.entries(fr.taskLogs)) if (v && v.length) newLogs[Number(k)] = v;
+        newLogs[-1] = validationLogs;
+        const fixedN = fr.tasks.filter((t) => t.status === "completed").length;
+        log.info(`validator: 修复批完成 ${fixedN}/${fr.tasks.length}`);
+        return {
+          tasks: [...state.tasks, ...fr.tasks], allTasks: [...state.allTasks, ...fr.tasks],
+          taskResults: newResults, taskLogs: newLogs,
+          bigTaskIndex: nextIdx, runtimeState: RuntimeState.VALIDATING,
+        };
+      } catch (e) {
+        log.warn(`validator: 修复批失败, 回退常规流程: ${(e as Error).message}`);
+      }
     }
 
     const fixes = await autoFix(report.issues);

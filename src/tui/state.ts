@@ -188,8 +188,8 @@ export function initState() {
   // ── Chat 事件 ──
   bus.on("chat:user", (raw: any) => {
     t0 = Date.now();
-    pushOne(`❯ ${d(raw).text ?? raw?.text}`, "user");
-    pushOne("", "user");
+    // 气泡化: 无需 ❯ 前缀 (输入框提示符已有), 空行由分组层吞并
+    pushOne(`${d(raw).text ?? raw?.text}`, "user");
     frameScheduler.flushNow();
   });
 
@@ -201,7 +201,7 @@ export function initState() {
     push([
       { id: thoughtId, text: `  Thought for .`, kind: "thought" as const },
       { id: ++_lid, text: "", kind: "assistant" as const },
-      { id: ++_lid, text: "● ", kind: "assistant" as const },
+      { id: ++_lid, text: "", kind: "assistant" as const }, // 头像前缀由渲染层统一添加
     ]);
     frameScheduler.requestFlush();
     let dots = 1;
@@ -316,7 +316,7 @@ export function initState() {
   bus.on("chat:assistant", (raw: any) => {
     const text = (d(raw).text as string) ?? "";
     const lines = text.split("\n");
-    pushOne(`● ${lines[0]}`, "assistant");
+    pushOne(lines[0], "assistant"); // ● 头像由渲染层统一添加
     for (let i = 1; i < lines.length; i++) pushOne(lines[i], "assistant");
     pushOne("", "info"); // 回复后空一行，与下次消息分隔
     frameScheduler.requestFlush();

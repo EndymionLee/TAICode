@@ -11,6 +11,7 @@ import { HumanMessage, SystemMessage, AIMessage, ToolMessage, type BaseMessage }
 import { createLLMClient } from "../core/llm.js";
 import { toolsList } from "../core/tools/registry.js";
 import { createLogger } from "../core/logger.js";
+import { recordAIMessage } from "../core/llm/cache-telemetry.js";
 
 const log = createLogger("react-agent");
 
@@ -35,6 +36,7 @@ export async function reactAgent(
 
   for (let step = 0; step < maxSteps; step++) {
     const result = await model.invoke(messages) as AIMessage;
+    recordAIMessage(result, "react-agent");
     messages.push(result);
 
     if (!result.tool_calls || result.tool_calls.length === 0) {

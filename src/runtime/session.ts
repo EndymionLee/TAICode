@@ -17,6 +17,7 @@ import { events } from "../core/events.js";
 import { TASK_GATE_PROMPT } from "../task/prompts.js";
 import { createLogger } from "../core/logger.js";
 import { extractFileRefs } from "../core/file-refs.js";
+import { resetCacheTelemetry, logCacheReport } from "../core/llm/cache-telemetry.js";
 
 const log = createLogger("runtime");
 const CWD = process.env.TAICODE_CWD ?? process.cwd();
@@ -29,6 +30,17 @@ function makeSessionDir(): string {
   const dir = path.join(SESSIONS_DIR, ts);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+/** 输出本轮缓存命中报告并落 jsonl (跨会话分析) */
+function emitCacheReport(tag: string): void {
+  try {
+    const r = logCacheReport(`缓存命中 ${tag}`);
+    const taiDir = DATA_DIR;
+    if (!fs.existsSync(taiDir)) fs.mkdirSync(taiDir, { recursive: true });
+    fs.appendFileSync(path.join(taiDir, "cache-stats.jsonl"),
+      JSON.stringify({ ts: new Date().toISOString(), tag, ...r }) + "\n", "utf-8");
+  } catch { /* ignore */ }
 }
 
 const CHAT_SYSTEM_PROMPT = `你是 TAICode，一个 AI 编程助手。
@@ -96,6 +108,7 @@ export class Session {
   /** 处理用户输入, 返回 AI 回复。仅 emit 事件, 不接触终端。 */
   async ask(userInput: string): Promise<string> {
     events.chat.user(userInput);  // 必须在 LLM 调用之前, 确保 UI 先显示用户消息
+    resetCacheTelemetry(); // 每轮独立统计缓存命中 (chat 流式无 usage, 主要覆盖 task 管线)
     const context = await this.memory.compileContext(userInput);
     log.info(`对话 #${this.turnCount + 1}: lastWasTask=${this._lastWasTask}`);
 
@@ -124,6 +137,7 @@ export class Session {
       void this.memory.process(userInput, response).catch(() => {});
       this.memory.recordTaskOutcome(userInput, response, extractFileRefs(response));
       this.turnCount++;
+      emitCacheReport(`task: ${userInput.slice(0, 30)}`);
       return response;
     }
     {
@@ -236,6 +250,7 @@ export class Session {
 
     await this.memory.process(userInput, response);
     this.turnCount++;
+    emitCacheReport(`chat: ${userInput.slice(0, 30)}`);
     if (this.turnCount % AUTO_SAVE_INTERVAL === 0) await this.save();
     return response;
   }

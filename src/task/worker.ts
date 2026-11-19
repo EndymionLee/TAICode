@@ -22,6 +22,7 @@ import { newTrace, newSpan, clearSpan, spanPrefix } from "../core/trace.js";
 import { sharedSnapshotService, countSnapshotDiff, type Snapshot } from "../core/snapshot-service.js";
 import { extractFileRefs } from "../core/file-refs.js";
 import { parseWorkerOutput } from "./worker-output.js";
+import { recordAIMessage } from "../core/llm/cache-telemetry.js";
 
 export { parseWorkerOutput } from "./worker-output.js";
 
@@ -103,6 +104,12 @@ export interface WorkerResult {
 export interface WorkerOptions {
   /** 外层超时/DAG 取消时置 true, Worker 在当前步边界尽快退出 (而非被外层 race 遗弃后空转) */
   shouldAbort?: () => boolean;
+  /**
+   * 共享规格块 — 所有 Worker 字节级一致, 拼在 system 尾部固定位置:
+   * ① 延长跨 Worker 的公共前缀 (DeepSeek 前缀缓存命中 ~1/10 价)
+   * ② 省去每个 Worker read_file 读 spec.json 的一次工具往返
+   */
+  sharedSpec?: string;
 }
 
 /** React Worker: 执行单个任务的完整 ReAct 循环 */
@@ -138,7 +145,8 @@ export async function reactWorker(
   let maxSteps = Math.min(60, 20 + fileCount * 5 + complexity * 10);
 
   const messages: BaseMessage[] = [
-    new SystemMessage(WORKER_SYSTEM_PROMPT),
+    // system = 冻结规则层 + 共享规格层 (全 Worker 字节一致 → 前缀缓存跨 Worker 命中)
+    new SystemMessage(WORKER_SYSTEM_PROMPT + (opts.sharedSpec ?? "")),
     new HumanMessage(taskPrompt),
   ];
 
@@ -223,6 +231,7 @@ export async function reactWorker(
     }
 
     if (!response) return { taskId: tid, result: parseWorkerOutput("", desc, tid), logs, error: "LLM 响应为空" };
+    recordAIMessage(response, `worker-${workerId}`);
     messages.push(response);
 
     // 🔧 重复回复检测 — LLM 连续输出相同内容 ×3 → 思考循环

@@ -104,7 +104,8 @@ export const WORKER_SYSTEM_PROMPT = `你是任务执行 Worker。独立完成分
 Planner 和 TaskSplitter 已经观察过项目了。你只管执行分配给你的任务，不要自己探索。
 前置任务的结果里有 cwd 和 created 字段。修改已有文件前先 read_file 确认内容。
 
-项目 .TAI/ 目录下有 spec.json（全局规格），所有 Worker 必须遵守其中的 spec 和 contract，不允许自己猜配置。
+项目规格以 system 尾部的「项目规格」共享块为准,必须遵守其中的 spec 和 contract,不允许自己猜配置。
+若该块已附出,直接遵循即可,禁止再花工具调用去 read_file 读 .TAI/spec.json。
 不同 Worker 写的文件接口必须一致。写完 Python 文件后按以下三层验证：
 
 ## 验证规则（三层，按文件类型选择）

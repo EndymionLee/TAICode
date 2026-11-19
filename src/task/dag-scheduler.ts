@@ -121,14 +121,15 @@ export function mergeDependencies(
 export class DAGScheduler {
   async execute(
     tasks: SubTask[],
-    dependencies: Record<string, number[]>
+    dependencies: Record<string, number[]>,
+    opts: { sharedSpec?: string } = {},
   ): Promise<{
     tasks: SubTask[];
     completedTasks: number[];
     taskResults: Record<number, string>;
     taskLogs: Record<number, string[]>;
   }> {
-    log.info(`DAG 调度: ${tasks.length} 任务, 依赖: ${JSON.stringify(dependencies)}, Worker=${MAX_WORKERS}`);
+    log.info(`DAG 调度: ${tasks.length} 任务, 依赖: ${JSON.stringify(dependencies)}, Worker=${MAX_WORKERS}${opts.sharedSpec ? ", spec已注入" : ""}`);
     events.dag.start(tasks.length, MAX_WORKERS);
     // 重置预算，每批任务独立计数
     getSandboxInstance().reset();
@@ -170,7 +171,7 @@ export class DAGScheduler {
       let timedOut = false;
       try {
         return await Promise.race([
-          reactWorker(task, workerId, { shouldAbort: () => timedOut }),
+          reactWorker(task, workerId, { shouldAbort: () => timedOut, sharedSpec: opts.sharedSpec }),
           new Promise<WorkerResult>((resolve) => {
             const timer = setTimeout(() => {
               timedOut = true;

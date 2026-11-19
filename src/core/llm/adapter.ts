@@ -8,6 +8,7 @@ import { AIMessage } from "@langchain/core/messages";
 import type { BaseMessage } from "@langchain/core/messages";
 import type { ToolDefinition } from "../types.js";
 import { embedMany } from "./embed.js";
+import { recordCacheUsage, extractCacheUsage } from "./cache-telemetry.js";
 
 export interface LLMAdapter {
   readonly modelName: string;
@@ -71,6 +72,7 @@ export class OpenAICompatAdapter implements LLMAdapter {
   async chat(messages: BaseMessage[], options?: { temperature?: number }): Promise<string> {
     if (options?.temperature !== undefined) this.model.temperature = options.temperature;
     const r = await this.model.invoke(messages);
+    recordCacheUsage(extractCacheUsage(r), `chat:${this.modelName}`);
     return typeof r.content === "string" ? r.content : "";
   }
 

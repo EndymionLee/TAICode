@@ -67,7 +67,9 @@ const TaskAnnotation = Annotation.Root({
   bigTaskIndex: Annotation<number>({ reducer: (_c, n) => n, default: () => 0 }),
   bigTasks: Annotation<SubTask[]>({ reducer: (_c, n) => n, default: () => [] }),
   workspace: Annotation<string>({ reducer: (_c, n) => n, default: () => "" }),
-  spec: Annotation<string[]>({ reducer: (_c, n) => n, default: () => [] }),
+  spec: Annotation<Record<string, unknown>>({ reducer: (_c, n) => n, default: () => ({}) }),
+  // 快速路径: 最后一批 ≤2 任务且无依赖 → 跳过 Validator 大轮 (Worker prompt 级自验仍在)
+  skipValidation: Annotation<boolean>({ reducer: (_c, n) => n, default: () => false }),
   specFiles: Annotation<string[]>({ reducer: (_c, n) => n, default: () => [] }),
   contract: Annotation<Record<string, number>>({ reducer: (_c, n) => n, default: () => ({}) }),
   dagCompleted: Annotation<boolean>({ reducer: (_c, n) => n, default: () => false }),
@@ -305,13 +307,27 @@ async function planner(state: TaskState): Promise<Partial<TaskState>> {
       .replace("{userInput}", `${shortCtx ? `对话历史(仅供参考):\n${shortCtx}\n\n当前请求: ` : ""}${state.userInput}`)
       .replace("{skills}", skillContext)
       .replace("{workspace}", state.workspace || process.env.TAICODE_CWD || process.cwd());
+
+    // ── 快速路径①: 小工作区观察短路 (与 taskSplitter 同款, 省观察往返) ──
+    const wsDir0 = state.workspace || process.env.TAICODE_CWD || process.cwd();
+    let obsNote = "";
+    try {
+      const entries = fs.readdirSync(wsDir0).filter((f) => f !== ".TAI" && !f.startsWith("."));
+      if (entries.length <= 5) {
+        obsNote = `\n\n[工作区现状] 当前目录仅含: ${entries.length ? entries.join(", ") : "(空目录)"}\n以上即全部信息, 无需再用 ls/read_file 观察, 直接输出最终 JSON。`;
+        log.info(`planner: 观察短路 (工作区 ${entries.length} 项)`);
+      }
+    } catch { /* 读目录失败走正常观察 */ }
+
     const response = await reactAgent(
-      "你是项目规划专家。用 ls/read_file 观察项目，再输出 JSON。",
-      prompt,
-      8,
+      obsNote
+        ? "你是项目规划专家。工作区现状已给出, 直接输出 JSON。"
+        : "你是项目规划专家。用 ls/read_file 观察项目，再输出 JSON。",
+      prompt + obsNote,
+      obsNote ? 3 : 8,
     );
     const json = extractJson(response);
-    const parsed = safeJsonParse<{ spec?: string[]; contract?: Record<string, number>; files?: string[]; bigTasks?: { id: number; goal: string; files?: string[] }[] }>(json);
+    const parsed = safeJsonParse<{ spec?: Record<string, unknown>; contract?: Record<string, number>; files?: string[]; bigTasks?: { id: number; goal: string; files?: string[] }[] }>(json);
 
     if (parsed?.bigTasks && parsed.bigTasks.length > 0) {
       const bigTasks: SubTask[] = parsed.bigTasks.map((t, i) => ({
@@ -333,12 +349,12 @@ async function planner(state: TaskState): Promise<Partial<TaskState>> {
         const taiDir = path.join(ws, ".TAI");
         if (!fs.existsSync(taiDir)) fs.mkdirSync(taiDir, { recursive: true });
         const specPath = path.join(taiDir, "spec.json");
-        fs.writeFileSync(specPath, JSON.stringify({ spec: parsed.spec ?? [], contract: parsed.contract ?? {}, files: parsed.files ?? [], workspace: ws }, null, 2), "utf-8");
+        fs.writeFileSync(specPath, JSON.stringify({ spec: parsed.spec ?? {}, contract: parsed.contract ?? {}, files: parsed.files ?? [], workspace: ws }, null, 2), "utf-8");
         log.info(`spec.json 已落盘: ${specPath}`);
       } catch { /* ignore */ }
       const specFiles = parsed.files || [];
       if (specFiles.length > 0) log.info(`specFiles: ${specFiles.length} 个文件 → ${specFiles.slice(0, 10).join(", ")}`);
-      return { spec: parsed.spec ?? [], specFiles, contract: parsed.contract ?? {}, bigTasks, tasks: bigTasks, dependencies: deps, bigTaskIndex: 0, runtimeState: advanceRuntimeState(state.runtimeState, RuntimeState.SPLITTING, "planner: 输出bigTasks") };
+      return { spec: parsed.spec ?? {}, specFiles, contract: parsed.contract ?? {}, bigTasks, tasks: bigTasks, dependencies: deps, bigTaskIndex: 0, runtimeState: advanceRuntimeState(state.runtimeState, RuntimeState.SPLITTING, "planner: 输出bigTasks") };
     }
   } catch (e) {
     log.warn("Planner 解析失败，回退为单任务:", e);
@@ -381,11 +397,26 @@ async function taskSplitter(state: TaskState): Promise<Partial<TaskState>> {
     .replace("{context}", (ctx || "(无)").slice(0, 500))
     .replace("{completedFiles}", completedStr);
 
+  // ── 快速路径①: 小工作区观察短路 ─────────────────────────────
+  // 目录基本为空时, 直接把清单嵌入 prompt, 省去 ReAct 的 ls/read_file 观察往返。
+  // (Planner/Splitter 每组观察 2-4 次调用, 是小任务时延大头)
+  const wsDir = state.workspace || process.env.TAICODE_CWD || process.cwd();
+  let observationNote = "";
+  try {
+    const entries = fs.readdirSync(wsDir).filter((f) => f !== ".TAI" && !f.startsWith("."));
+    if (entries.length <= 5) {
+      observationNote = `\n\n[工作区现状] 当前目录仅含: ${entries.length ? entries.join(", ") : "(空目录)"}\n以上即全部信息, 无需再用 ls/read_file 观察, 直接输出最终 JSON。`;
+      log.info(`taskSplitter: 观察短路 (工作区 ${entries.length} 项: ${entries.slice(0, 5).join(", ") || "空"})`);
+    }
+  } catch { /* 读目录失败走正常观察 */ }
+
   try {
     const response = await reactAgent(
-      "你是任务拆分专家。用 ls/read_file 观察项目文件，再输出 JSON。",
-      prompt,
-      8,
+      observationNote
+        ? "你是任务拆分专家。工作区现状已给出, 直接输出 JSON。"
+        : "你是任务拆分专家。用 ls/read_file 观察项目文件，再输出 JSON。",
+      prompt + observationNote,
+      observationNote ? 3 : 8,
     );
     const json = extractJson(response);
     const parsed = safeJsonParse<{
@@ -438,21 +469,31 @@ async function taskSplitter(state: TaskState): Promise<Partial<TaskState>> {
       if (skipped.length > 0) log.info(`代码层跳过 ${skipped.length} 个重复创建: ${skipped.join("; ")}`);
 
       const deps = normalizeDependencies(parsed.dependencies ?? {});
+      // ── 快速路径②: 最后一批 + ≤2任务 + 无依赖 → 跳过 Validator 大轮
+      const isLastBatch = idx >= bigTasks.length - 1;
+      const noDeps = Object.keys(deps).every((k) => (deps[k] ?? []).length === 0);
+      const skipValidation = isLastBatch && filtered.length <= 2 && noDeps;
       const note = merged.length < rawTasks.length ? ` (合并前${rawTasks.length}个)` : "";
-      log.info(`taskSplitter: → ${filtered.length} 个小任务${note}${skipped.length > 0 ? ` (跳过${skipped.length}个已有文件)` : ""}`);
-      return { tasks: filtered, dependencies: deps, runtimeState: advanceRuntimeState(state.runtimeState, RuntimeState.EXECUTING, "taskSplitter: 拆分完成") };
+      log.info(`taskSplitter: → ${filtered.length} 个小任务${note}${skipped.length > 0 ? ` (跳过${skipped.length}个已有文件)` : ""}${skipValidation ? " [快速路径: 跳过Validator]" : ""}`);
+      return { tasks: filtered, dependencies: deps, skipValidation, runtimeState: advanceRuntimeState(state.runtimeState, RuntimeState.EXECUTING, "taskSplitter: 拆分完成") };
     }
   } catch (e) {
     log.warn("TaskSplitter 失败:", e);
   }
 
-  return { tasks: [{ id: 1, description: bigTask.description, status: "pending", result: "", contract: state.contract }], dependencies: {}, runtimeState: advanceRuntimeState(state.runtimeState, RuntimeState.EXECUTING, "taskSplitter: 回退单任务") };
+  return { tasks: [{ id: 1, description: bigTask.description, status: "pending", result: "", contract: state.contract }], dependencies: {}, skipValidation: true, runtimeState: advanceRuntimeState(state.runtimeState, RuntimeState.EXECUTING, "taskSplitter: 回退单任务") };
 }
 
 async function dagSchedulerNode(state: TaskState): Promise<Partial<TaskState>> {
   events.phase.running();
+  // 共享规格块 — 全部 Worker 字节级一致 (延长公共前缀 + 省每 Worker 读 spec.json 的一步往返)
+  const specObj: Record<string, unknown> = { spec: state.spec ?? {} };
+  if (state.contract && Object.keys(state.contract).length > 0) specObj.contract = state.contract;
+  const sharedSpec = Object.keys(state.spec ?? {}).length > 0
+    ? "\n\n## 项目规格 (全 Worker 共享, 必须遵守)\n```json\n" + JSON.stringify(specObj, null, 2) + "\n```"
+    : "";
   const tasks = state.tasks.map((t) => ({ ...t, status: "pending" as const }));
-  const result = await dagScheduler.execute(tasks, state.dependencies);
+  const result = await dagScheduler.execute(tasks, state.dependencies, { sharedSpec });
   events.phase.validating();
 
   // 提取已完成文件 → Planner 去重（含 FileState 追溯）
@@ -568,6 +609,14 @@ async function validatorNode(state: TaskState): Promise<Partial<TaskState>> {
   const validationLogs: string[] = [];
   let totalFixes = 0;
 
+  // 快速路径: 最后一批 ≤2 任务且无依赖 → 跳过 Validator (Worker prompt 级 Lint/Smoke 自验仍在)
+  if (state.skipValidation) {
+    log.info(`validator: 快速路径跳过验证 (单批小任务, Worker 已自验)`);
+    const taskLogs0 = { ...state.taskLogs };
+    taskLogs0[-1] = ["[验证] 快速路径: 跳过 (≤2任务无依赖, Worker自验)"];
+    return { taskLogs: taskLogs0, bigTaskIndex: nextIdx, runtimeState: RuntimeState.VALIDATING };
+  }
+
   for (let round = 1; round <= maxRetries; round++) {
     const report = await validateProject(state.allTasks, projectDir);
     if (report.allClean) {
@@ -608,7 +657,11 @@ async function simpleWorker(state: TaskState): Promise<Partial<TaskState>> {
   const shortCtx = (state as any)._shortTermContext || "";
   const desc = shortCtx ? `对话历史(仅供参考):\n${shortCtx}\n\n当前任务: ${state.userInput}` : state.userInput;
   const task: SubTask = { id: 0, description: desc, status: "in_progress", result: "" };
-  const result = await reactWorker(task, 0);
+  // 简单路径同样享受共享规格块 (有 spec 时与 Worker 前缀一致)
+  const sharedSpec = Object.keys(state.spec ?? {}).length > 0
+    ? "\n\n## 项目规格 (共享, 必须遵守)\n```json\n" + JSON.stringify({ spec: state.spec }) + "\n```"
+    : "";
+  const result = await reactWorker(task, 0, { sharedSpec });
   const response = result.error ? `执行出现问题: ${result.error}\n\n${result.result}` : result.result;
   return {
     messages: [new AIMessage(response)], taskResults: { 0: response },
@@ -709,7 +762,8 @@ export async function runTask(userInput: string, shortTermContext?: string): Pro
     _dagStartMs: Date.now(),
     bigTaskIndex: 0, bigTasks: [] as SubTask[], allTasks: [] as SubTask[],
     workspace: process.env.TAICODE_CWD ?? process.cwd(),
-    spec: [] as string[], specFiles: [] as string[], completedFiles: {} as Record<string, FileState>,
+    spec: {} as Record<string, unknown>, specFiles: [] as string[], completedFiles: {} as Record<string, FileState>,
+    skipValidation: false,
     runtimeState: RuntimeState.IDLE,
   };
   const result = await TaskGraph.invoke(initialState);

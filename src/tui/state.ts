@@ -200,8 +200,8 @@ export function initState() {
     const thoughtId = ++_lid;
     push([
       { id: thoughtId, text: `  Thought for .`, kind: "thought" as const },
-      { id: ++_lid, text: "", kind: "assistant" as const },
-      { id: ++_lid, text: "", kind: "assistant" as const }, // 头像前缀由渲染层统一添加
+      { id: ++_lid, text: "", kind: "info" as const },    // 间距行必须是 info — 若为 assistant 会进组, 头像独行
+      { id: ++_lid, text: "", kind: "assistant" as const }, // token 追加行, ● 头像由渲染层加
     ]);
     frameScheduler.requestFlush();
     let dots = 1;

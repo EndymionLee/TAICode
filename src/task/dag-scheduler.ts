@@ -11,6 +11,7 @@ import { events } from "../core/events.js";
 import { safeJsonParse } from "../core/json-utils.js";
 import { getSandboxInstance } from "../core/tools/registry.js";
 import { extractFileRefKeys } from "../core/file-refs.js";
+import { buildInlineContext } from "./inline-context.js";
 import type { ErrorClassification } from "../core/types.js";
 
 const log = createLogger("task:dag");
@@ -138,36 +139,16 @@ export class DAGScheduler {
     const taskResults: Record<number, string> = {};
     const taskLogs: Record<number, string[]> = {};
     const running = new Map<number, Promise<WorkerResult>>();
+    // 一次性准备标记 — 前置 summary + 产物内联只在首次调度时注入。
+    // (重试会重跑 executeTask, 原版对 description 重复拼接"前置已完成",
+    //  P1-2 内联块最多 32KB 会把该缺陷放大成上下文污染 → WeakSet 根治)
+    const prepared = new WeakSet<object>();
 
-    const executeTask = async (task: SubTask, workerId: number): Promise<WorkerResult> => {
-      // 只传直接依赖的 summary，不是全部结果
-      const depIds = dependencies[String(task.id)] ?? [];
-      if (depIds.length > 0) {
-        const ctxParts: string[] = [];
-        for (const did of depIds) {
-          const raw = taskResults[did];
-          if (!raw) continue;
-          const j = safeJsonParse<{ summary?: string; cwd?: string; created?: string[]; deleted?: string[]; modified?: string[] }>(raw);
-          if (j?.summary) {
-            const cwd = j.cwd ? ` [目录: ${j.cwd}]` : "";
-            ctxParts.push(`#${did}: ${j.summary}${cwd}`);
-          } else if (j) {
-            const acts: string[] = [];
-            if (j.created?.length) acts.push(`创建了${j.created.join(",")}`);
-            if (j.deleted?.length) acts.push(`删除了${j.deleted.join(",")}`);
-            if (j.modified?.length) acts.push(`修改了${j.modified.join(",")}`);
-            ctxParts.push(`#${did}: ${acts.length ? acts.join("; ") : raw.slice(0, 100)}`);
-          } else {
-            ctxParts.push(`#${did}: ${raw.replace(/\n/g, " ").slice(0, 100)}`);
-          }
-        }
-        if (ctxParts.length) task.description = `${task.description}\n\n前置已完成:\n${ctxParts.join("\n")}`;
-      }
-      events.task.start(task.id, task.description);
-      await workerSemaphore.acquire();
+    /** 信号量 + 外层超时竞争 (主路径与重试快路径共用) */
+    const raceWithTimeout = async (task: SubTask, workerId: number): Promise<WorkerResult> => {
       // 外层超时不再 reject (旧实现一次超时直接击穿 execute 主循环, 整图崩溃):
       // 置 aborted 标记 → Worker 在步边界自行退出; race 解析为标准超时失败结果,
-      // 走下方统一的错误分类/重试通道。
+      // 走统一的错误分类/重试通道。
       let timedOut = false;
       try {
         return await Promise.race([
@@ -192,6 +173,51 @@ export class DAGScheduler {
           }),
         ]);
       } finally { workerSemaphore.release(); }
+    };
+
+    const executeTask = async (task: SubTask, workerId: number): Promise<WorkerResult> => {
+      // 重试快路径: 已准备过的任务 (前置注入只做一次, 不重复拼接)
+      if (prepared.has(task)) {
+        events.task.start(task.id, task.description);
+        await workerSemaphore.acquire();
+        return raceWithTimeout(task, workerId);
+      }
+      prepared.add(task);
+      // 只传直接依赖的 summary，不是全部结果
+      const depIds = dependencies[String(task.id)] ?? [];
+      if (depIds.length > 0) {
+        const ctxParts: string[] = [];
+        for (const did of depIds) {
+          const raw = taskResults[did];
+          if (!raw) continue;
+          const j = safeJsonParse<{ summary?: string; cwd?: string; created?: string[]; deleted?: string[]; modified?: string[] }>(raw);
+          if (j?.summary) {
+            const cwd = j.cwd ? ` [目录: ${j.cwd}]` : "";
+            ctxParts.push(`#${did}: ${j.summary}${cwd}`);
+          } else if (j) {
+            const acts: string[] = [];
+            if (j.created?.length) acts.push(`创建了${j.created.join(",")}`);
+            if (j.deleted?.length) acts.push(`删除了${j.deleted.join(",")}`);
+            if (j.modified?.length) acts.push(`修改了${j.modified.join(",")}`);
+            ctxParts.push(`#${did}: ${acts.length ? acts.join("; ") : raw.slice(0, 100)}`);
+          } else {
+            ctxParts.push(`#${did}: ${raw.replace(/\n/g, " ").slice(0, 100)}`);
+          }
+        }
+        if (ctxParts.length) task.description = `${task.description}\n\n前置已完成:\n${ctxParts.join("\n")}`;
+        // P1-2 前置产物内联 — 下游直接拿上游产物内容, 省 read_file 一轮往返
+        // (拼在任务描述=首条 HumanMessage 尾部, 不破坏 system 共享前缀)
+        const depResults: Record<number, string> = {};
+        for (const did of depIds) { const r = taskResults[did]; if (r) depResults[did] = r; }
+        const inline = buildInlineContext(depResults);
+        if (inline) {
+          task.description += inline;
+          log.info(`任务 #${task.id} 内联 ${Object.keys(depResults).length} 个前置产物块`);
+        }
+      }
+      events.task.start(task.id, task.description);
+      await workerSemaphore.acquire();
+      return raceWithTimeout(task, workerId);
     };
 
     // 错误分类器 — 同一种失败不应重试

@@ -23,6 +23,7 @@ import { sharedSnapshotService, countSnapshotDiff, type Snapshot } from "../core
 import { extractFileRefs } from "../core/file-refs.js";
 import { parseWorkerOutput } from "./worker-output.js";
 import { recordAIMessage } from "../core/llm/cache-telemetry.js";
+import { quickLint } from "./quick-lint.js";
 
 export { parseWorkerOutput } from "./worker-output.js";
 
@@ -155,6 +156,11 @@ export async function reactWorker(
   let sameErrorCount = 0;
   let noProgressSteps = 0;
 
+  // P1-3 验证前移 — 本 Worker 触碰的文件 + 自修复轮次
+  const touchedFiles = new Set<string>();
+  let lintFixRounds = 0;
+  const TOUCH_TOOLS = new Set(["write_file", "sed", "mv", "cp", "mkdir"]);
+
   // 四层活动/死循环检测
   let lastToolKey = "";           // "toolName:argsHash"
   let repeatToolCount = 0;
@@ -263,6 +269,21 @@ export async function reactWorker(
       if (!toolsCalled && taskNeedsTools(desc)) {
         return { taskId: tid, result: parseWorkerOutput(response.content as string || "", desc, tid), logs, error: "幻觉: 未调用工具" };
       }
+
+      // P1-3 验证前移 — 代码层强制语法检查(py_compile/node --check/tsc),
+      // 失败注入系统反馈同循环自修复 (≤2轮), 免走一轮 DAG 重试调度
+      if (lintFixRounds < 2 && touchedFiles.size > 0) {
+        const lintErr = await quickLint([...touchedFiles]);
+        if (lintErr) {
+          lintFixRounds++;
+          logs.push(`[Worker-${workerId}] 快速验证失败 (${lintFixRounds}/2): ${lintErr.slice(0, 200)}`);
+          workerLog.warn(`验证前移: 语法错误, 注入反馈自修复 (${lintFixRounds}/2)`);
+          messages.push(new HumanMessage(`[系统验证反馈] 你产出的文件存在语法错误, 请立即用工具修复后重新输出结果 JSON:\n${lintErr}`));
+          continue;
+        }
+        logs.push(`[Worker-${workerId}] 快速验证通过 (${touchedFiles.size} 文件)`);
+      }
+
       logs.push(`[Worker-${workerId}] 任务 #${tid} 完成 (${step + 1} 步)`);
       const validationError = validateWorkerResult(task, logs);
       if (validationError) {
@@ -305,6 +326,12 @@ export async function reactWorker(
       try {
         const tool = allTools.find((t: any) => t.name === toolName);
         if (tool) {
+          // 收集触碰文件 (验证前移用; write_file/sed 用 path, mv/cp 用 target)
+          if (TOUCH_TOOLS.has(toolName)) {
+            const a = args as any;
+            const p = a?.path ?? a?.target ?? a?.dest;
+            if (typeof p === "string" && p) touchedFiles.add(String(p));
+          }
           const result = await tool.execute(args);
           logs.push(`[Worker-${workerId}] 工具结果: ${result.slice(0, 200)}`);
           if (/ImportError|SyntaxError|ModuleNotFoundError|IndentationError/i.test(result)) {

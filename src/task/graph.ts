@@ -18,6 +18,7 @@ import { validateProject, autoFix } from "./validator.js";
 import { searchSkills } from "../core/skill-index.js";
 import { events } from "../core/events.js";
 import { extractFileRefs, fileKey, isRegisteredFile } from "../core/file-refs.js";
+import { buildObservation } from "../core/observation.js";
 import {
   RuntimeState, advanceRuntimeState, resetViolations, getViolations,
 } from "./state-machine.js";
@@ -308,16 +309,11 @@ async function planner(state: TaskState): Promise<Partial<TaskState>> {
       .replace("{skills}", skillContext)
       .replace("{workspace}", state.workspace || process.env.TAICODE_CWD || process.cwd());
 
-    // ── 快速路径①: 小工作区观察短路 (与 taskSplitter 同款, 省观察往返) ──
+    // ── 观察注入: ≤50 项机械清单直接入 prompt, 免 ReAct 观察 (统一走 observation.ts) ──
     const wsDir0 = state.workspace || process.env.TAICODE_CWD || process.cwd();
-    let obsNote = "";
-    try {
-      const entries = fs.readdirSync(wsDir0).filter((f) => f !== ".TAI" && !f.startsWith("."));
-      if (entries.length <= 5) {
-        obsNote = `\n\n[工作区现状] 当前目录仅含: ${entries.length ? entries.join(", ") : "(空目录)"}\n以上即全部信息, 无需再用 ls/read_file 观察, 直接输出最终 JSON。`;
-        log.info(`planner: 观察短路 (工作区 ${entries.length} 项)`);
-      }
-    } catch { /* 读目录失败走正常观察 */ }
+    const obs0 = buildObservation(wsDir0);
+    const obsNote = obs0.note ?? "";
+    if (obsNote) log.info(`planner: 观察注入 (${obs0.entries}项, 指纹${obs0.fingerprint})`);
 
     const response = await reactAgent(
       obsNote
@@ -398,17 +394,11 @@ async function taskSplitter(state: TaskState): Promise<Partial<TaskState>> {
     .replace("{completedFiles}", completedStr);
 
   // ── 快速路径①: 小工作区观察短路 ─────────────────────────────
-  // 目录基本为空时, 直接把清单嵌入 prompt, 省去 ReAct 的 ls/read_file 观察往返。
-  // (Planner/Splitter 每组观察 2-4 次调用, 是小任务时延大头)
+  // ── 观察注入: ≤50 项机械清单直接入 prompt, 免 ReAct 观察 (统一走 observation.ts) ──
   const wsDir = state.workspace || process.env.TAICODE_CWD || process.cwd();
-  let observationNote = "";
-  try {
-    const entries = fs.readdirSync(wsDir).filter((f) => f !== ".TAI" && !f.startsWith("."));
-    if (entries.length <= 5) {
-      observationNote = `\n\n[工作区现状] 当前目录仅含: ${entries.length ? entries.join(", ") : "(空目录)"}\n以上即全部信息, 无需再用 ls/read_file 观察, 直接输出最终 JSON。`;
-      log.info(`taskSplitter: 观察短路 (工作区 ${entries.length} 项: ${entries.slice(0, 5).join(", ") || "空"})`);
-    }
-  } catch { /* 读目录失败走正常观察 */ }
+  const obs = buildObservation(wsDir);
+  const observationNote = obs.note ?? "";
+  if (observationNote) log.info(`taskSplitter: 观察注入 (${obs.entries}项, 指纹${obs.fingerprint})`);
 
   try {
     const response = await reactAgent(

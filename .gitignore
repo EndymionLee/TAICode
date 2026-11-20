@@ -39,3 +39,4 @@ ProjectRecord/process-records/
 .e2e/
 scripts/tui-preview.txt
 scripts/tui-live.txt
+scripts/tui-live-task.txt

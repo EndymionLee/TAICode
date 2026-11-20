@@ -17,53 +17,25 @@ import { reactAgent } from "./react-agent.js";
 import { validateProject, autoFix } from "./validator.js";
 import { searchSkills } from "../core/skill-index.js";
 import { events } from "../core/events.js";
+import { extractFileRefs, fileKey, isRegisteredFile } from "../core/file-refs.js";
+import { buildObservation } from "../core/observation.js";
+import {
+  RuntimeState, advanceRuntimeState, resetViolations, getViolations,
+} from "./state-machine.js";
 import * as fs from "fs";
 import * as path from "path";
 
 const log = createLogger("task:graph");
 const llm = createLLMClient({ temperature: 0 });
+/** ifPlan 分类专用 — LLM_GATE_MODEL 可配便宜档 (缺省回落主模型) */
+const gateLlm = createLLMClient({ model: process.env.LLM_GATE_MODEL || undefined, temperature: 0 });
 const dagScheduler = new DAGScheduler();
 
 // ============================================================================
-// 显式状态机 — RuntimeState 替代隐式状态转换
+// 显式状态机 — 见 ./state-machine.ts
+//   advanceRuntimeState() 是唯一推进入口: 返回值直接写入 state,
+//   非法转换计数+自愈, TAICODE_STRICT_STATE=1 时抛异常。
 // ============================================================================
-
-enum RuntimeState {
-  IDLE = "idle",
-  IF_PLAN = "if_plan",
-  PLANNING = "planning",
-  SPLITTING = "splitting",
-  EXECUTING = "executing",
-  VALIDATING = "validating",
-  REPAIRING = "repairing",
-  SUMMARIZING = "summarizing",
-  FINISHED = "finished",
-}
-
-const VALID_TRANSITIONS: Record<RuntimeState, RuntimeState[]> = {
-  [RuntimeState.IDLE]:        [RuntimeState.IF_PLAN],
-  [RuntimeState.IF_PLAN]:     [RuntimeState.PLANNING, RuntimeState.EXECUTING],
-  [RuntimeState.PLANNING]:    [RuntimeState.SPLITTING],
-  [RuntimeState.SPLITTING]:   [RuntimeState.EXECUTING],
-  [RuntimeState.EXECUTING]:   [RuntimeState.VALIDATING],
-  // 大任务循环: VALIDATING → SPLITTING (多轮) 或 EXECUTING (TaskSplitter 拆完直接执行)
-  [RuntimeState.VALIDATING]:  [RuntimeState.SPLITTING, RuntimeState.EXECUTING, RuntimeState.SUMMARIZING, RuntimeState.REPAIRING],
-  [RuntimeState.REPAIRING]:   [RuntimeState.VALIDATING, RuntimeState.SUMMARIZING],
-  [RuntimeState.SUMMARIZING]: [RuntimeState.FINISHED],
-  [RuntimeState.FINISHED]:    [],
-};
-
-function transition(from: RuntimeState, to: RuntimeState, context: string): void {
-  // 幂等转换 — 同状态直接返回
-  if (from === to) return;
-  const allowed = VALID_TRANSITIONS[from];
-  if (!allowed || !allowed.includes(to)) {
-    log.error(`非法状态转换: ${from} → ${to} (${context})`);
-    // 不抛异常 — 生产环境记录但不中断，避免 LangGraph 状态污染
-  } else {
-    log.debug(`状态: ${from} → ${to} (${context})`);
-  }
-}
 
 // Main Agent 专用日志
 const MA_LOG = path.resolve(process.env.TAICODE_CWD ?? process.cwd(), ".TAI", "logs", "main-agent.log");
@@ -87,6 +59,9 @@ const TaskAnnotation = Annotation.Root({
   userInput: Annotation<string>({ reducer: (_c, n) => n, default: () => "" }),
   needDecompose: Annotation<boolean>({ reducer: (_c, n) => n, default: () => false }),
   tasks: Annotation<SubTask[]>({ reducer: (_c, n) => n, default: () => [] }),
+  // 结算台账 — 跨批次累积已结算任务(带 status/writes)。
+  // tasks 字段会被 taskSplitter 按批次整体替换, 不能承载历史 → 计数/一致性断言以 allTasks 为准
+  allTasks: Annotation<SubTask[]>({ reducer: (_c, n) => n, default: () => [] }),
   dependencies: Annotation<Record<string, number[]>>({ reducer: (_c, n) => n, default: () => ({}) }),
   completedTasks: Annotation<number[]>({ reducer: (_c, n) => n, default: () => [] }),
   taskResults: Annotation<Record<number, string>>({ reducer: (_c, n) => n, default: () => ({}) }),
@@ -95,7 +70,9 @@ const TaskAnnotation = Annotation.Root({
   bigTaskIndex: Annotation<number>({ reducer: (_c, n) => n, default: () => 0 }),
   bigTasks: Annotation<SubTask[]>({ reducer: (_c, n) => n, default: () => [] }),
   workspace: Annotation<string>({ reducer: (_c, n) => n, default: () => "" }),
-  spec: Annotation<string[]>({ reducer: (_c, n) => n, default: () => [] }),
+  spec: Annotation<Record<string, unknown>>({ reducer: (_c, n) => n, default: () => ({}) }),
+  // 快速路径: 最后一批 ≤2 任务且无依赖 → 跳过 Validator 大轮 (Worker prompt 级自验仍在)
+  skipValidation: Annotation<boolean>({ reducer: (_c, n) => n, default: () => false }),
   specFiles: Annotation<string[]>({ reducer: (_c, n) => n, default: () => [] }),
   contract: Annotation<Record<string, number>>({ reducer: (_c, n) => n, default: () => ({}) }),
   dagCompleted: Annotation<boolean>({ reducer: (_c, n) => n, default: () => false }),
@@ -115,9 +92,9 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
   const taskResultCount = Object.keys(state.taskResults).length;
   const fileCount = Object.keys(state.completedFiles).length;
   log.info(`main_agent 进入: dagCompleted=${state.dagCompleted}, taskResults=${taskResultCount}, files=${fileCount}, needDecompose=${state.needDecompose}, finalAnswer.length=${state.finalAnswer.length}`);
-  const successN = state.tasks.filter(t=>t.status==="completed").length;
-  const failN = state.tasks.filter(t=>t.status==="failed").length;
-  const skipN = state.tasks.filter(t=>t.status==="pending").length;
+  const successN = state.allTasks.filter(t=>t.status==="completed").length;
+  const failN = state.allTasks.filter(t=>t.status==="failed").length;
+  const skipN = state.allTasks.filter(t=>t.status==="pending").length;
   const logCount = Object.keys(state.taskLogs).filter(k => Number(k) >= 0).length; // 排除 validator 哨兵
   log.info(`  任务明细: 成功=${successN} 失败=${failN} 跳过=${skipN}`);
   log.info(`  状态一致性: results=${taskResultCount} logs=${logCount} completed=${state.completedTasks.length} total=${successN+failN+skipN}`);
@@ -125,7 +102,7 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
   // 一致性断言 — 含差集定位
   const resultIds = new Set(Object.keys(state.taskResults).map(Number));
   const logIds = new Set(Object.keys(state.taskLogs).map(Number).filter(id => id >= 0)); // 排除 validator 哨兵 -1
-  const taskIds = new Set(state.tasks.map(t => t.id));
+  const taskIds = new Set(state.allTasks.map(t => t.id));
   const consistent = taskIds.size === resultIds.size && logIds.size >= resultIds.size;
 
   if (taskIds.size !== resultIds.size) {
@@ -142,7 +119,7 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
   const dagStart = (state as any)._dagStartMs || 0;
   const duration = dagStart ? ((Date.now() - dagStart) / 1000).toFixed(1) + "s" : "N/A";
   log.info("══════════ DAG FINAL STATE ══════════");
-  log.info(`  Tasks:       ${state.tasks.length}`);
+  log.info(`  Tasks:       ${state.allTasks.length}`);
   log.info(`  Results:     ${taskResultCount}`);
   log.info(`  Logs:        ${logCount}`);
   log.info(`  Completed:   ${state.completedTasks.length}`);
@@ -156,7 +133,7 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
 
   // 第 1 优先级：DAG 已完成 → 汇总
   if (state.dagCompleted && taskResultCount > 0) {
-    transition(state.runtimeState, RuntimeState.SUMMARIZING, "main_agent: DAG已完成→汇总");
+    const sumState = advanceRuntimeState(state.runtimeState, RuntimeState.SUMMARIZING, "main_agent: DAG已完成→汇总");
     if (!state.needDecompose && state.tasks.length === 0) {
       const raw = Object.values(state.taskResults)[0] || "(无回复)";
       // 尝试提取 summary，避免 raw JSON 透传
@@ -166,7 +143,7 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
         directAnswer = j.summary || j.sumary || raw;
       } catch { /* not JSON, use raw */ }
       log.info(`main_agent: 简单任务直接输出, 长度=${directAnswer.length}`);
-      return { finalAnswer: directAnswer, messages: [new AIMessage(directAnswer)], loopCount: (state.loopCount ?? 0) + 1, runtimeState: RuntimeState.FINISHED };
+      return { finalAnswer: directAnswer, messages: [new AIMessage(directAnswer)], loopCount: (state.loopCount ?? 0) + 1, runtimeState: advanceRuntimeState(sumState, RuntimeState.FINISHED, "main_agent: 简单任务直出") };
     }
 
     log.info("══════ MAIN AGENT 开始汇总 ══════");
@@ -174,7 +151,7 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
     events.phase.summarizing();
 
     // 收集失败任务
-    const failedTasks = state.tasks.filter((t) => t.status === "failed");
+    const failedTasks = state.allTasks.filter((t) => t.status === "failed");
     const failedNote = failedTasks.length > 0
       ? "\n\n[失败任务]\n" + failedTasks.map((t) => `- #${t.id} ${t.description.slice(0, 80)}: 执行失败，以下成功任务的 summary 中提及此文件不代表已创建`).join("\n")
       : "";
@@ -184,7 +161,7 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
     const entries = Object.entries(state.taskResults);
 
     for (const [id, result] of entries) {
-      const task = state.tasks.find((t) => t.id === Number(id));
+      const task = state.allTasks.find((t) => t.id === Number(id));
       const label = task ? task.description : `任务${id}`;
       let parsed: any = null;
       try { parsed = JSON.parse(result); } catch { /* text */ }
@@ -218,7 +195,7 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
     const seen = new Set<string>();
     const deduped: string[] = [];
     for (const [id] of entries) {
-      const task = state.tasks.find((t) => t.id === Number(id));
+      const task = state.allTasks.find((t) => t.id === Number(id));
       const files = (() => { try { const j = JSON.parse(state.taskResults[Number(id)]); return (j.created ?? []).concat(j.modified ?? []); } catch { return []; } })();
       const keys: string[] = files.length > 0 ? files.map((f: string) => f.toLowerCase().replace(/\\/g, "/")) : [`_notask_${id}`];
       const latestKeys = keys.map((k: string) => fileVersion.get(k)?.id).filter((v): v is string => !!v);
@@ -230,7 +207,7 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
     const summaries = deduped.join("\n\n") || "(无结果)";
 
     // 统计信息
-    const allTasks = state.tasks;
+    const allTasks = state.allTasks;
     const successCount = allTasks.filter((t) => t.status === "completed").length;
     const failCount = allTasks.filter((t) => t.status === "failed").length;
     const skipCount = allTasks.filter((t) => t.status === "pending").length;
@@ -266,7 +243,7 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
       finalAnswer: summaryText,
       messages: [new AIMessage(summaryText)],
       loopCount: (state.loopCount ?? 0) + 1,
-      runtimeState: RuntimeState.FINISHED,
+      runtimeState: advanceRuntimeState(sumState, RuntimeState.FINISHED, "main_agent: 汇总完成"),
     };
   }
 
@@ -276,16 +253,16 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
     const hasAiMsg = msgs.some((m) => m instanceof AIMessage && m.content && !m.tool_calls?.length);
     if (!hasAiMsg && state.finalAnswer === "") {
       log.info("main_agent: 首次入口(简单模式)，透传");
-      return { loopCount: (state.loopCount ?? 0) + 1, runtimeState: RuntimeState.IF_PLAN };
+      return { loopCount: (state.loopCount ?? 0) + 1, runtimeState: advanceRuntimeState(state.runtimeState, RuntimeState.IF_PLAN, "main_agent: 首次入口") };
     }
     const lastAi = [...msgs].reverse().find((m) => m instanceof AIMessage && m.content);
     if (lastAi) {
       const content = typeof lastAi.content === "string" ? lastAi.content : "";
       log.info(`main_agent: Simple路径, finalAnswer="${content.slice(0, 50)}"`);
-      return { finalAnswer: content || "(无内容)", loopCount: (state.loopCount ?? 0) + 1, runtimeState: RuntimeState.FINISHED };
+      return { finalAnswer: content || "(无内容)", loopCount: (state.loopCount ?? 0) + 1, runtimeState: advanceRuntimeState(state.runtimeState, RuntimeState.FINISHED, "main_agent: Simple路径直出") };
     }
     log.info("main_agent: Simple路径, 无AI消息");
-    return { loopCount: (state.loopCount ?? 0) + 1, runtimeState: RuntimeState.IF_PLAN };
+    return { loopCount: (state.loopCount ?? 0) + 1, runtimeState: advanceRuntimeState(state.runtimeState, RuntimeState.IF_PLAN, "main_agent: Simple路径无消息") };
   }
 
   // 第 3 优先级：等待 DAG
@@ -300,8 +277,8 @@ async function mainAgent(state: TaskState): Promise<Partial<TaskState>> {
 async function ifPlan(state: TaskState): Promise<Partial<TaskState>> {
   const history = (state as any)._shortTermContext || "";
 
-  log.info(`if_plan: LLM 判断复杂度`);
-  const response = await llm.chat(
+  log.info(`if_plan: LLM 判断复杂度 (模型: ${gateLlm.modelName})`);
+  const response = await gateLlm.chat(
     [new HumanMessage(IF_PLAN_PROMPT.replace("{userInput}", state.userInput).replace("{history}", history))],
     { temperature: 0 }
   );
@@ -310,11 +287,9 @@ async function ifPlan(state: TaskState): Promise<Partial<TaskState>> {
     const workspace = json.workspace && json.workspace !== "." ? json.workspace : "";
     const nextState = json.needDecompose === true ? RuntimeState.PLANNING : RuntimeState.EXECUTING;
     log.info(`[ifPlan] needDecompose=${json.needDecompose} reason=${json.reason || "?"} workspace=${json.workspace || "."}`);
-    transition(state.runtimeState, nextState, `if_plan: ${json.needDecompose ? "planner" : "simple_worker"}`);
-    return { needDecompose: json.needDecompose === true, workspace, runtimeState: nextState };
+    return { needDecompose: json.needDecompose === true, workspace, runtimeState: advanceRuntimeState(state.runtimeState, nextState, `if_plan: ${json.needDecompose ? "planner" : "simple_worker"}`) };
   } catch {
-    transition(state.runtimeState, RuntimeState.EXECUTING, "if_plan: parse失败→simple_worker");
-    return { needDecompose: false, runtimeState: RuntimeState.EXECUTING };
+    return { needDecompose: false, runtimeState: advanceRuntimeState(state.runtimeState, RuntimeState.EXECUTING, "if_plan: parse失败→simple_worker") };
   }
 }
 
@@ -335,13 +310,35 @@ async function planner(state: TaskState): Promise<Partial<TaskState>> {
       .replace("{userInput}", `${shortCtx ? `对话历史(仅供参考):\n${shortCtx}\n\n当前请求: ` : ""}${state.userInput}`)
       .replace("{skills}", skillContext)
       .replace("{workspace}", state.workspace || process.env.TAICODE_CWD || process.cwd());
+
+    // ── 观察注入: ≤50 项机械清单直接入 prompt, 免 ReAct 观察 (统一走 observation.ts) ──
+    const wsDir0 = state.workspace || process.env.TAICODE_CWD || process.cwd();
+    const obs0 = buildObservation(wsDir0);
+    const obsNote = obs0.note ?? "";
+    if (obsNote) log.info(`planner: 观察注入 (${obs0.entries}项, 指纹${obs0.fingerprint})`);
+
+    // ── P2-4 spec 会话级复用: 同指纹工作区注入上次规格参考 (可沿用可改, 不约束) ──
+    let specReuseNote = "";
+    try {
+      const cachePath = path.join(wsDir0, ".TAI", "spec-cache.json");
+      if (fs.existsSync(cachePath) && obs0.fingerprint) {
+        const cached = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
+        if (cached.fingerprint === obs0.fingerprint && cached.spec && Object.keys(cached.spec).length > 0) {
+          specReuseNote = `\n\n[上次同指纹工作区的规格参考 — 结构未变, 可直接沿用或按新需求修改, 自行判断]\n\`\`\`json\n${JSON.stringify({ spec: cached.spec, contract: cached.contract ?? {} }, null, 2)}\n\`\`\``;
+          log.info(`planner: spec 会话级复用命中 (指纹${obs0.fingerprint})`);
+        }
+      }
+    } catch { /* 缓存损坏走常规 */ }
+
     const response = await reactAgent(
-      "你是项目规划专家。用 ls/read_file 观察项目，再输出 JSON。",
-      prompt,
-      8,
+      obsNote
+        ? "你是项目规划专家。工作区现状已给出, 直接输出 JSON。"
+        : "你是项目规划专家。用 ls/read_file 观察项目，再输出 JSON。",
+      prompt + obsNote + specReuseNote,
+      obsNote ? 3 : 8,
     );
     const json = extractJson(response);
-    const parsed = safeJsonParse<{ spec?: string[]; contract?: Record<string, number>; files?: string[]; bigTasks?: { id: number; goal: string; files?: string[] }[] }>(json);
+    const parsed = safeJsonParse<{ spec?: Record<string, unknown>; contract?: Record<string, number>; files?: string[]; bigTasks?: { id: number; goal: string; files?: string[] }[] }>(json);
 
     if (parsed?.bigTasks && parsed.bigTasks.length > 0) {
       const bigTasks: SubTask[] = parsed.bigTasks.map((t, i) => ({
@@ -363,19 +360,26 @@ async function planner(state: TaskState): Promise<Partial<TaskState>> {
         const taiDir = path.join(ws, ".TAI");
         if (!fs.existsSync(taiDir)) fs.mkdirSync(taiDir, { recursive: true });
         const specPath = path.join(taiDir, "spec.json");
-        fs.writeFileSync(specPath, JSON.stringify({ spec: parsed.spec ?? [], contract: parsed.contract ?? {}, files: parsed.files ?? [], workspace: ws }, null, 2), "utf-8");
+        fs.writeFileSync(specPath, JSON.stringify({ spec: parsed.spec ?? {}, contract: parsed.contract ?? {}, files: parsed.files ?? [], workspace: ws }, null, 2), "utf-8");
         log.info(`spec.json 已落盘: ${specPath}`);
+        // P2-4: 指纹关联的规格缓存 (下次同指纹工作区注入参考)
+        if (obs0.fingerprint) {
+          try {
+            fs.writeFileSync(path.join(taiDir, "spec-cache.json"), JSON.stringify({
+              fingerprint: obs0.fingerprint, spec: parsed.spec ?? {}, contract: parsed.contract ?? {},
+              files: parsed.files ?? [], userInput: state.userInput.slice(0, 100), ts: Date.now(),
+            }, null, 2), "utf-8");
+          } catch { /* ignore */ }
+        }
       } catch { /* ignore */ }
       const specFiles = parsed.files || [];
       if (specFiles.length > 0) log.info(`specFiles: ${specFiles.length} 个文件 → ${specFiles.slice(0, 10).join(", ")}`);
-      transition(state.runtimeState, RuntimeState.SPLITTING, "planner: 输出bigTasks");
-      return { spec: parsed.spec ?? [], specFiles, contract: parsed.contract ?? {}, bigTasks, tasks: bigTasks, dependencies: deps, bigTaskIndex: 0, runtimeState: RuntimeState.SPLITTING };
+      return { spec: parsed.spec ?? {}, specFiles, contract: parsed.contract ?? {}, bigTasks, tasks: bigTasks, dependencies: deps, bigTaskIndex: 0, runtimeState: advanceRuntimeState(state.runtimeState, RuntimeState.SPLITTING, "planner: 输出bigTasks") };
     }
   } catch (e) {
     log.warn("Planner 解析失败，回退为单任务:", e);
   }
-  transition(state.runtimeState, RuntimeState.SPLITTING, "planner: 回退单任务");
-  return { tasks: [{ id: 1, description: state.userInput, status: "pending", result: "" }], dependencies: {}, runtimeState: RuntimeState.SPLITTING };
+  return { tasks: [{ id: 1, description: state.userInput, status: "pending", result: "" }], dependencies: {}, runtimeState: advanceRuntimeState(state.runtimeState, RuntimeState.SPLITTING, "planner: 回退单任务") };
 }
 
 // ============================================================================
@@ -413,11 +417,20 @@ async function taskSplitter(state: TaskState): Promise<Partial<TaskState>> {
     .replace("{context}", (ctx || "(无)").slice(0, 500))
     .replace("{completedFiles}", completedStr);
 
+  // ── 快速路径①: 小工作区观察短路 ─────────────────────────────
+  // ── 观察注入: ≤50 项机械清单直接入 prompt, 免 ReAct 观察 (统一走 observation.ts) ──
+  const wsDir = state.workspace || process.env.TAICODE_CWD || process.cwd();
+  const obs = buildObservation(wsDir);
+  const observationNote = obs.note ?? "";
+  if (observationNote) log.info(`taskSplitter: 观察注入 (${obs.entries}项, 指纹${obs.fingerprint})`);
+
   try {
     const response = await reactAgent(
-      "你是任务拆分专家。用 ls/read_file 观察项目文件，再输出 JSON。",
-      prompt,
-      8,
+      observationNote
+        ? "你是任务拆分专家。工作区现状已给出, 直接输出 JSON。"
+        : "你是任务拆分专家。用 ls/read_file 观察项目文件，再输出 JSON。",
+      prompt + observationNote,
+      observationNote ? 3 : 8,
     );
     const json = extractJson(response);
     const parsed = safeJsonParse<{
@@ -432,14 +445,14 @@ async function taskSplitter(state: TaskState): Promise<Partial<TaskState>> {
       }));
 
       // 同文件合并：多个小任务描述指向同一文件 → 合为一个
+      // (unicode 健壮提取: 中文文件名/多级扩展名/路径 basename)
       const merged: typeof rawTasks = [];
-      const fileOwners = new Map<string, number>(); // 文件名 → 合并后的索引
+      const fileOwners = new Map<string, number>(); // 归一化文件名 → 合并后的索引
       for (const t of rawTasks) {
-        const files = t.description.match(/([a-zA-Z0-9_-]+\.[a-z]{1,6})/gi) ?? [];
+        const files = extractFileRefs(t.description).map(fileKey);
         let ownerIdx = -1;
         for (const f of files) {
-          const k = f.toLowerCase();
-          if (fileOwners.has(k)) { ownerIdx = fileOwners.get(k)!; break; }
+          if (fileOwners.has(f)) { ownerIdx = fileOwners.get(f)!; break; }
         }
         if (ownerIdx >= 0) {
           // 合并到已有任务
@@ -447,18 +460,20 @@ async function taskSplitter(state: TaskState): Promise<Partial<TaskState>> {
         } else {
           const idx = merged.length;
           merged.push(t);
-          for (const f of files) fileOwners.set(f.toLowerCase(), idx);
+          for (const f of files) fileOwners.set(f, idx);
         }
       }
 
       // 🔧 代码层去重 — 过滤已有文件的 create 任务（不靠 LLM，硬兜底）
+      // completedFiles 键是相对路径 ("cc/a.py"), 提取到的是 basename —
+      // isRegisteredFile 补后缀匹配, 修复旧代码 basename 直查永不命中的缺陷
       const skipped: string[] = [];
       const filtered = merged.filter((t) => {
         const isCreate = /创建|新建|create|mkdir/i.test(t.description);
         if (!isCreate) return true; // 修改类任务不过滤
-        const taskFiles = t.description.match(/([a-zA-Z0-9_-]+\.[a-z]{1,6})/gi) ?? [];
+        const taskFiles = extractFileRefs(t.description);
         if (taskFiles.length === 0) return true; // 无明确文件名的任务不过滤
-        const allExist = taskFiles.every((f) => state.completedFiles[f.toLowerCase()]);
+        const allExist = taskFiles.every((f) => isRegisteredFile(state.completedFiles, f));
         if (allExist) {
           skipped.push(taskFiles.join(","));
           return false;
@@ -468,23 +483,31 @@ async function taskSplitter(state: TaskState): Promise<Partial<TaskState>> {
       if (skipped.length > 0) log.info(`代码层跳过 ${skipped.length} 个重复创建: ${skipped.join("; ")}`);
 
       const deps = normalizeDependencies(parsed.dependencies ?? {});
+      // ── 快速路径②: 最后一批 + ≤2任务 + 无依赖 → 跳过 Validator 大轮
+      const isLastBatch = idx >= bigTasks.length - 1;
+      const noDeps = Object.keys(deps).every((k) => (deps[k] ?? []).length === 0);
+      const skipValidation = isLastBatch && filtered.length <= 2 && noDeps;
       const note = merged.length < rawTasks.length ? ` (合并前${rawTasks.length}个)` : "";
-      log.info(`taskSplitter: → ${filtered.length} 个小任务${note}${skipped.length > 0 ? ` (跳过${skipped.length}个已有文件)` : ""}`);
-      transition(state.runtimeState, RuntimeState.EXECUTING, "taskSplitter: 拆分完成");
-      return { tasks: filtered, dependencies: deps, runtimeState: RuntimeState.EXECUTING };
+      log.info(`taskSplitter: → ${filtered.length} 个小任务${note}${skipped.length > 0 ? ` (跳过${skipped.length}个已有文件)` : ""}${skipValidation ? " [快速路径: 跳过Validator]" : ""}`);
+      return { tasks: filtered, dependencies: deps, skipValidation, runtimeState: advanceRuntimeState(state.runtimeState, RuntimeState.EXECUTING, "taskSplitter: 拆分完成") };
     }
   } catch (e) {
     log.warn("TaskSplitter 失败:", e);
   }
 
-  transition(state.runtimeState, RuntimeState.EXECUTING, "taskSplitter: 回退单任务");
-  return { tasks: [{ id: 1, description: bigTask.description, status: "pending", result: "", contract: state.contract }], dependencies: {}, runtimeState: RuntimeState.EXECUTING };
+  return { tasks: [{ id: 1, description: bigTask.description, status: "pending", result: "", contract: state.contract }], dependencies: {}, skipValidation: true, runtimeState: advanceRuntimeState(state.runtimeState, RuntimeState.EXECUTING, "taskSplitter: 回退单任务") };
 }
 
 async function dagSchedulerNode(state: TaskState): Promise<Partial<TaskState>> {
   events.phase.running();
+  // 共享规格块 — 全部 Worker 字节级一致 (延长公共前缀 + 省每 Worker 读 spec.json 的一步往返)
+  const specObj: Record<string, unknown> = { spec: state.spec ?? {} };
+  if (state.contract && Object.keys(state.contract).length > 0) specObj.contract = state.contract;
+  const sharedSpec = Object.keys(state.spec ?? {}).length > 0
+    ? "\n\n## 项目规格 (全 Worker 共享, 必须遵守)\n```json\n" + JSON.stringify(specObj, null, 2) + "\n```"
+    : "";
   const tasks = state.tasks.map((t) => ({ ...t, status: "pending" as const }));
-  const result = await dagScheduler.execute(tasks, state.dependencies);
+  const result = await dagScheduler.execute(tasks, state.dependencies, { sharedSpec });
   events.phase.validating();
 
   // 提取已完成文件 → Planner 去重（含 FileState 追溯）
@@ -538,7 +561,7 @@ async function dagSchedulerNode(state: TaskState): Promise<Partial<TaskState>> {
     }
   }
 
-  transition(state.runtimeState, RuntimeState.VALIDATING, "dagScheduler: 执行完成");
+  const validatingState = advanceRuntimeState(state.runtimeState, RuntimeState.VALIDATING, "dagScheduler: 执行完成");
 
   // === 全局 ID 空间 — 跨 DAG 批次统一 remap ===
   function remapBatch(
@@ -575,13 +598,30 @@ async function dagSchedulerNode(state: TaskState): Promise<Partial<TaskState>> {
   const allTaskLogs = { ...state.taskLogs, ...batch.logs };
   const allCompleted = [...state.completedTasks, ...batch.completed];
 
+  // P2-4 补: 轮末回写指纹 — planner 存的是轮初指纹, 任务执行后文件已变,
+  // 下轮初观察必然对不上; 用轮末状态刷新 spec-cache.fingerprint 才能命中复用
+  try {
+    const wsEnd = state.workspace || process.env.TAICODE_CWD || process.cwd();
+    const obsEnd = buildObservation(wsEnd);
+    const spCache = path.join(wsEnd, ".TAI", "spec-cache.json");
+    if (fs.existsSync(spCache) && obsEnd.fingerprint) {
+      const j = JSON.parse(fs.readFileSync(spCache, "utf-8"));
+      j.fingerprint = obsEnd.fingerprint;
+      j.ts = Date.now();
+      fs.writeFileSync(spCache, JSON.stringify(j, null, 2), "utf-8");
+      log.info(`spec-cache 指纹回写(轮末): ${obsEnd.fingerprint}`);
+    }
+  } catch { /* ignore */ }
+
   log.info(`DAG 合并: +${batch.completed.length} → results=${Object.keys(allTaskResults).length} files=${Object.keys(completedFiles).length}`);
 
   return {
-    tasks: [...state.tasks, ...batch.tasks], completedTasks: allCompleted,
+    // tasks=本批次已结算副本(供 router/后续节点读当批); allTasks=全批次台账(计数/一致性)
+    tasks: batch.tasks, allTasks: [...state.allTasks, ...batch.tasks],
+    completedTasks: allCompleted,
     taskResults: allTaskResults, taskLogs: allTaskLogs,
     dagCompleted: true, needDecompose: false,
-    completedFiles, runtimeState: RuntimeState.VALIDATING,
+    completedFiles, runtimeState: validatingState,
   };
 }
 
@@ -591,15 +631,23 @@ async function validatorNode(state: TaskState): Promise<Partial<TaskState>> {
   const nextIdx = state.bigTaskIndex + 1;
   log.info(`validator: 大任务 ${nextIdx}/${state.bigTasks.length} 完成`);
 
-  const rootTask = state.tasks.find((t) => t.writes?.some((w) => w.endsWith("/")));
+  const rootTask = state.allTasks.find((t) => t.writes?.some((w) => w.endsWith("/")));
   const projectDir = rootTask?.writes?.find((w) => w.endsWith("/")) ?? ".";
   const maxRetries = 3;
 
   const validationLogs: string[] = [];
   let totalFixes = 0;
 
+  // 快速路径: 最后一批 ≤2 任务且无依赖 → 跳过 Validator (Worker prompt 级 Lint/Smoke 自验仍在)
+  if (state.skipValidation) {
+    log.info(`validator: 快速路径跳过验证 (单批小任务, Worker 已自验)`);
+    const taskLogs0 = { ...state.taskLogs };
+    taskLogs0[-1] = ["[验证] 快速路径: 跳过 (≤2任务无依赖, Worker自验)"];
+    return { taskLogs: taskLogs0, bigTaskIndex: nextIdx, runtimeState: RuntimeState.VALIDATING };
+  }
+
   for (let round = 1; round <= maxRetries; round++) {
-    const report = await validateProject(state.tasks, projectDir);
+    const report = await validateProject(state.allTasks, projectDir);
     if (report.allClean) {
       if (round === 1) {
         log.info(`验证通过: ${projectDir} 项目结构完整`);
@@ -613,6 +661,40 @@ async function validatorNode(state: TaskState): Promise<Partial<TaskState>> {
     for (const issue of report.issues) {
       log.warn(`  [${issue.type}] ${issue.message}`);
       validationLogs.push(`[验证] [${issue.type}] ${issue.message}`);
+    }
+
+    // P2-1 轻量局部重规划 — autoFix 治不了的 missing_import (缺本地模块文件):
+    // 生成单文件修复任务直接执行, 不整批回炉 TaskSplitter (结构性问题仍走大循环)
+    const missingImports = report.issues.filter((i) => i.type === "missing_import");
+    if (round === 1 && missingImports.length > 0 && missingImports.length <= 3) {
+      const baseId = Math.max(0, ...state.allTasks.map((t) => t.id));
+      const fixTasks: SubTask[] = missingImports.map((iss, i) => ({
+        id: baseId + 1 + i,
+        description: `修复任务: Validator 发现 ${iss.message.slice(0, 160)}。请创建该缺失的文件/模块, 做满足引用方的最小实现 (只修复, 不扩展功能), 完成后输出 JSON`,
+        status: "pending" as const, result: "", contract: state.contract,
+      }));
+      log.info(`validator: 轻量重规划 → ${fixTasks.length} 个修复任务直接执行`);
+      validationLogs.push(`[重规划] ${fixTasks.length} 个 missing_import → 修复任务 #${fixTasks.map((t) => t.id).join(",#")}`);
+      const sharedSpecFix = Object.keys(state.spec ?? {}).length > 0
+        ? "\n\n## 项目规格 (全 Worker 共享, 必须遵守)\n```json\n" + JSON.stringify({ spec: state.spec, ...(Object.keys(state.contract ?? {}).length ? { contract: state.contract } : {}) }, null, 2) + "\n```"
+        : "";
+      try {
+        const fr = await dagScheduler.execute(fixTasks, {}, { sharedSpec: sharedSpecFix });
+        const newResults = { ...state.taskResults };
+        const newLogs = { ...state.taskLogs };
+        for (const [k, v] of Object.entries(fr.taskResults)) newResults[Number(k)] = v;
+        for (const [k, v] of Object.entries(fr.taskLogs)) if (v && v.length) newLogs[Number(k)] = v;
+        newLogs[-1] = validationLogs;
+        const fixedN = fr.tasks.filter((t) => t.status === "completed").length;
+        log.info(`validator: 修复批完成 ${fixedN}/${fr.tasks.length}`);
+        return {
+          tasks: [...state.tasks, ...fr.tasks], allTasks: [...state.allTasks, ...fr.tasks],
+          taskResults: newResults, taskLogs: newLogs,
+          bigTaskIndex: nextIdx, runtimeState: RuntimeState.VALIDATING,
+        };
+      } catch (e) {
+        log.warn(`validator: 修复批失败, 回退常规流程: ${(e as Error).message}`);
+      }
     }
 
     const fixes = await autoFix(report.issues);
@@ -638,18 +720,22 @@ async function simpleWorker(state: TaskState): Promise<Partial<TaskState>> {
   const shortCtx = (state as any)._shortTermContext || "";
   const desc = shortCtx ? `对话历史(仅供参考):\n${shortCtx}\n\n当前任务: ${state.userInput}` : state.userInput;
   const task: SubTask = { id: 0, description: desc, status: "in_progress", result: "" };
-  const result = await reactWorker(task, 0);
+  // 简单路径同样享受共享规格块 (有 spec 时与 Worker 前缀一致)
+  const sharedSpec = Object.keys(state.spec ?? {}).length > 0
+    ? "\n\n## 项目规格 (共享, 必须遵守)\n```json\n" + JSON.stringify({ spec: state.spec }) + "\n```"
+    : "";
+  const result = await reactWorker(task, 0, { sharedSpec });
   const response = result.error ? `执行出现问题: ${result.error}\n\n${result.result}` : result.result;
-  transition(state.runtimeState, RuntimeState.SUMMARIZING, "simpleWorker: 执行完成");
   return {
     messages: [new AIMessage(response)], taskResults: { 0: response },
     taskLogs: { 0: result.logs }, dagCompleted: true, needDecompose: false,
-    runtimeState: RuntimeState.SUMMARIZING,
+    runtimeState: advanceRuntimeState(state.runtimeState, RuntimeState.SUMMARIZING, "simpleWorker: 执行完成"),
   };
 }
 
 // ============================================================================
-// 路由 — 显式状态机统一管理，替代分散的 router 函数
+// 路由 — 纯路由决策, 不再承担状态推进 (runtimeState 由各节点唯一推进,
+// 两套系统从此收敛为一套, 漂移由 state-machine 违规计数暴露)
 // ============================================================================
 
 function unifiedRouter(state: TaskState, fromNode: string): string {
@@ -678,9 +764,7 @@ function unifiedRouter(state: TaskState, fromNode: string): string {
 
   // if_plan 节点: needDecompose → planner, else → simple_worker
   if (fromNode === "if_plan") {
-    const next = state.needDecompose ? "planner" : "simple_worker";
-    transition(state.runtimeState, state.needDecompose ? RuntimeState.PLANNING : RuntimeState.EXECUTING, `router: if_plan→${next}`);
-    return next;
+    return state.needDecompose ? "planner" : "simple_worker";
   }
 
   // simple_worker 之后: 有 tasks → dag_scheduler, else → main_agent
@@ -693,10 +777,8 @@ function unifiedRouter(state: TaskState, fromNode: string): string {
   if (fromNode === "validator") {
     const idx = state.bigTaskIndex + 1;
     if (state.bigTasks.length > 0 && idx < state.bigTasks.length) {
-      transition(state.runtimeState, RuntimeState.SPLITTING, "router: validator→task_splitter(更多大任务)");
       return "task_splitter";
     }
-    transition(state.runtimeState, RuntimeState.SUMMARIZING, "router: validator→main_agent(汇总)");
     return "main_agent";
   }
 
@@ -731,6 +813,7 @@ const TaskGraph = new StateGraph(TaskAnnotation)
 // ============================================================================
 
 export async function runTask(userInput: string, shortTermContext?: string): Promise<string> {
+  resetViolations(); // 每次 runTask 独立统计状态机违规
   const initialState = {
     _shortTermContext: shortTermContext,
     messages: [new HumanMessage(userInput)], userInput,
@@ -740,12 +823,18 @@ export async function runTask(userInput: string, shortTermContext?: string): Pro
     taskLogs: {} as Record<number, string[]>,
     finalAnswer: "", dagCompleted: false, loopCount: 0,
     _dagStartMs: Date.now(),
-    bigTaskIndex: 0, bigTasks: [] as SubTask[],
+    bigTaskIndex: 0, bigTasks: [] as SubTask[], allTasks: [] as SubTask[],
     workspace: process.env.TAICODE_CWD ?? process.cwd(),
-    spec: [] as string[], specFiles: [] as string[], completedFiles: {} as Record<string, FileState>,
+    spec: {} as Record<string, unknown>, specFiles: [] as string[], completedFiles: {} as Record<string, FileState>,
+    skipValidation: false,
     runtimeState: RuntimeState.IDLE,
   };
   const result = await TaskGraph.invoke(initialState);
+  const violations = getViolations();
+  if (violations.length > 0) {
+    log.warn(`状态机违规 ${violations.length} 处 (自愈完成, 详情如下):`);
+    for (const v of violations) log.warn(`  ${v.from} → ${v.to} (${v.context})`);
+  }
   events.phase.done();
   return result.finalAnswer || "(未生成回复)";
 }

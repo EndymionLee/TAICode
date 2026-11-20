@@ -1,6 +1,17 @@
 /**
  * Task 模块提示词模板
+ *
+ * PROMPT_VERSION: v2 (2026-11-19)
+ * ── 冻结纪律 (缓存前缀契约) ──
+ * 模板文本是全部 Worker/Agent 共享前缀的一部分 — 修改任意一个字符会使
+ * DeepSeek 前缀缓存全量失效 (输入成本 ×10)。发版原则:
+ *   1. 增量只允许追加到模板尾部或新模板常量, 不改已有行
+ *   2. 行为调整优先在代码层 (注入块/观察块), 不动模板正文
+ *   3. 确需破坏性改模板 → PROMPT_VERSION 递增, 并在 commit 里注明缓存重置
  */
+
+/** 模板版本号 — 供遥测/日志对齐缓存代际 */
+export const PROMPT_VERSION = "v2";
 
 // ============================================================================
 // Planner — 项目拆分为大任务
@@ -104,18 +115,22 @@ export const WORKER_SYSTEM_PROMPT = `你是任务执行 Worker。独立完成分
 Planner 和 TaskSplitter 已经观察过项目了。你只管执行分配给你的任务，不要自己探索。
 前置任务的结果里有 cwd 和 created 字段。修改已有文件前先 read_file 确认内容。
 
-项目 .TAI/ 目录下有 spec.json（全局规格），所有 Worker 必须遵守其中的 spec 和 contract，不允许自己猜配置。
+项目规格以 system 尾部的「项目规格」共享块为准,必须遵守其中的 spec 和 contract,不允许自己猜配置。
+若该块已附出,直接遵循即可,禁止再花工具调用去 read_file 读 .TAI/spec.json。
 不同 Worker 写的文件接口必须一致。写完 Python 文件后按以下三层验证：
 
 ## 验证规则（三层，按文件类型选择）
-### ① Lint（所有 .py 文件必做）
-python -c "import 模块名"
-验证语法正确 + 依赖存在。不要跑完整脚本。
+### ① Lint（所有源码文件必做）
+Python: python -c "import 模块名" （验证语法+依赖）
+JS/TS: node --check 文件.js 或 node -e "require('./文件.js')"（TS 用 npx tsc --noEmit 单文件可选）
+其他语言: 用该语言的语法检查命令（rustc --edition 2021 --emit=metadata / javac / gcc -fsyntax-only 等）。
+不要跑完整脚本。
 
 ### ② Smoke（模型/工具类文件必做）
-python -c "from xxx import YYY; 关键类实例化; 一次前向传播"
+Python: python -c "from xxx import YYY; 关键类实例化; 一次前向传播"
 例如: python -c "from models.cnn import CatDogCNN; import torch; m=CatDogCNN(); m(torch.randn(1,3,224,224))"
-**仅验证模型能实例化+能跑通，不加载真实数据、不跑训练循环、不 import dataset。单次执行不超过 10 秒。如果 10 秒没完成直接 Ctrl+C 视为通过。**
+JS/TS: node -e "const m = require('./xxx'); m.YYY && typeof m.YYY === 'function' && m.YYY()"
+**仅验证能实例化+能跑通，不加载真实数据、不跑训练循环、不 import dataset。单次执行不超过 10 秒。如果 10 秒没完成直接 Ctrl+C 视为通过。**
 
 ### ③ Full（仅 train.py/test.py 可选）
 如果项目已有 best_model.pth 且任务要求验证训练/测试流程，才跑完整脚本。

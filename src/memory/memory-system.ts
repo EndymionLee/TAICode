@@ -9,6 +9,7 @@
 import * as fsAsync from "fs/promises";
 import * as path from "path";
 import type { LLMClient } from "../core/llm.js";
+import { embedModelName } from "../core/llm/embed.js";
 import { extractJson, safeJsonParse } from "../core/types.js";
 import type { MemoryEntry, SemanticSearchResult, PersonaData } from "../core/types.js";
 import { ContextCompiler } from "../core/context-compiler.js";
@@ -108,6 +109,9 @@ interface SemanticStore {
 export class SemanticMemory {
   private texts: string[] = [];
   private vectors: number[][] = [];
+  /** 范数缓存 — 检索时不再对每条向量重复 sqrt, n 条向量省 n 次开方 */
+  private norms: number[] = [];
+  private dim: number | null = null;
   private embedFn: (text: string) => Promise<number[] | null>;
 
   constructor(embedFn: (text: string) => Promise<number[] | null>) {
@@ -123,8 +127,10 @@ export class SemanticMemory {
         log.warn("SemanticMemory.add: embedding 返回空，跳过存储");
         return;
       }
+      if (this.dim === null) this.dim = vec.length;
       this.texts.push(text);
       this.vectors.push(vec);
+      this.norms.push(Math.sqrt(vec.reduce((s, v) => s + v * v, 0)));
     } catch (e) {
       log.warn("SemanticMemory.add 失败，跳过:", (e as Error).message);
     }
@@ -136,7 +142,7 @@ export class SemanticMemory {
 
     const queryVec = await this.embedFn(query).catch(() => null);
 
-    // 路径 1: embedding 可用 → 余弦相似度
+    // 路径 1: embedding 可用 → 余弦相似度 (范数走缓存)
     if (queryVec && queryVec.length > 0) {
       log.info(`语义搜索(向量): "${query.slice(0, 30)}" → ${Math.min(k, this.texts.length)}/${this.texts.length} 结果`);
       const qNorm = Math.sqrt(queryVec.reduce((s, v) => s + v * v, 0));
@@ -148,7 +154,7 @@ export class SemanticMemory {
         // 防御：维度不匹配跳过
         if (!vec || vec.length !== queryVec.length) continue;
         const dot = vec.reduce((s, v, j) => s + v * queryVec[j], 0);
-        const vNorm = Math.sqrt(vec.reduce((s, v) => s + v * v, 0));
+        const vNorm = this.norms[i] ?? Math.sqrt(vec.reduce((s, v) => s + v * v, 0));
         const denom = qNorm * vNorm;
         const score = denom > 0 ? dot / denom : 0;
         if (!isNaN(score)) {
@@ -197,30 +203,41 @@ export class SemanticMemory {
 
   async save(filePath: string): Promise<void> {
     await writeJsonFile(filePath, {
-      _meta: { model: "all-MiniLM-L6-v2", dimension: 384, updated: new Date().toISOString() },
+      _meta: {
+        model: embedModelName(),
+        dimension: this.dim ?? this.vectors[0]?.length ?? 0,
+        updated: new Date().toISOString(),
+      },
       texts: this.texts, vectors: this.vectors,
     });
   }
 
   async load(filePath: string): Promise<void> {
     const raw = await readJsonFile<any>(filePath, { texts: [], vectors: [] });
-    if (raw._meta && raw._meta.dimension !== 384) {
-      log.warn(`语义向量维度不匹配(存储=${raw._meta.dimension})，清空重建`);
-      this.texts = []; this.vectors = []; return;
+    // 换嵌入模型 → 向量空间不同, 必须清空重建 (硬编码 384 检查移除)
+    if (raw._meta?.model && raw._meta.model !== embedModelName()) {
+      log.warn(`嵌入模型已切换 (存储=${raw._meta.model}, 当前=${embedModelName()})，语义库清空重建`);
+      this.texts = []; this.vectors = []; this.norms = []; this.dim = null;
+      return;
     }
     this.texts = raw.texts ?? [];
     this.vectors = raw.vectors ?? [];
-    // 清理历史污染数据
+    // 清理历史污染数据 + 重建范数缓存
     const clean: number[][] = [];
+    const cleanNorms: number[] = [];
     const cleanTexts: string[] = [];
     for (let i = 0; i < this.vectors.length; i++) {
       if (this.vectors[i] && this.vectors[i].length > 0 && this.texts[i]) {
-        clean.push(this.vectors[i]);
+        const v = this.vectors[i];
+        clean.push(v);
+        cleanNorms.push(Math.sqrt(v.reduce((s, x) => s + x * x, 0)));
         cleanTexts.push(this.texts[i]);
       }
     }
     this.vectors = clean;
+    this.norms = cleanNorms;
     this.texts = cleanTexts;
+    this.dim = clean[0]?.length ?? null;
   }
 }
 
@@ -475,7 +492,136 @@ export class ImportantMemory {
 }
 
 // ============================================================================
-// 5. MemorySystem — 编排器
+// 5. ProjectMemory — 工程记忆 (跨会话持久)
+//
+// 修复"记忆陪伴向错位": coding agent 的长期记忆应是代码库事实
+// (技术栈/文件布局/决策/任务结果), 而非只有姓名兴趣语气。
+// 纯启发式提取, 不额外消耗 LLM 调用。
+// ============================================================================
+
+export interface ProjectFact {
+  text: string;
+  kind: "stack" | "layout" | "outcome" | "decision";
+  hits: number;
+  updatedAt: number;
+}
+
+const STACK_PATTERNS: Array<[RegExp, string]> = [
+  [/\bpython\b|\.py\b/i, "Python"],
+  [/\btypescript\b|\.tsx?\b/i, "TypeScript"],
+  [/\bjavascript\b|\.jsx?\b/i, "JavaScript"],
+  [/\breact\b/i, "React"],
+  [/\bvue\b/i, "Vue"],
+  [/\bsvelte\b/i, "Svelte"],
+  [/\bnode(?:\.?js)?\b|package\.json/i, "Node.js"],
+  [/\bexpress\b|fastify|koa/i, "Node服务端"],
+  [/\bflask\b|fastapi|django/i, "Python Web"],
+  [/\btorch\b|pytorch|tensorflow|keras/i, "深度学习"],
+  [/\bpandas\b|numpy|sklearn|scikit/i, "数据科学"],
+  [/\brust\b|cargo\.toml/i, "Rust"],
+  [/\bgo\b|go\.mod\b/i, "Go"],
+  [/\bjava\b|pom\.xml/i, "Java"],
+  [/\bc\+\+\b|\.cpp\b|cmake/i, "C++"],
+  [/\bsqlite\b|mysql|postgres/i, "数据库"],
+  [/\bffmpeg\b/i, "FFmpeg"],
+];
+
+export class ProjectMemory {
+  private facts: ProjectFact[] = [];
+  private maxFacts: number;
+
+  constructor(maxFacts: number = 60) {
+    this.maxFacts = maxFacts;
+  }
+
+  get count(): number { return this.facts.length; }
+
+  private upsert(text: string, kind: ProjectFact["kind"]): void {
+    const key = text.toLowerCase();
+    const existing = this.facts.find((f) => f.text.toLowerCase() === key);
+    if (existing) {
+      existing.hits++;
+      existing.updatedAt = Date.now();
+      return;
+    }
+    this.facts.push({ text, kind, hits: 1, updatedAt: Date.now() });
+    // LRU: 满 → 按 hits+时间淘汰
+    if (this.facts.length > this.maxFacts) {
+      this.facts.sort((a, b) => (b.hits * 1000 + b.updatedAt) - (a.hits * 1000 + a.updatedAt));
+      this.facts = this.facts.slice(0, this.maxFacts);
+    }
+  }
+
+  /** 任务完成后记录 — 启发式, 不耗 LLM */
+  recordTaskOutcome(userInput: string, answer: string, files: string[] = []): boolean {
+    let changed = false;
+    const corpus = `${userInput}\n${files.join("\n")}`;
+
+    // 技术栈事实
+    const stacks = STACK_PATTERNS.filter(([re]) => re.test(corpus)).map(([, name]) => name);
+    if (stacks.length > 0) {
+      this.upsert(`技术栈: ${[...new Set(stacks)].join(" + ")}`, "stack");
+      changed = true;
+    }
+
+    // 文件布局事实 (产物文件名, 最多 8 个)
+    if (files.length > 0) {
+      const sample = files.slice(0, 8).map((f) => f.replace(/\\/g, "/").split("/").pop()).filter(Boolean);
+      this.upsert(`文件布局: ${sample.join(", ")}${files.length > 8 ? ` (+${files.length - 8})` : ""}`, "layout");
+      changed = true;
+    }
+
+    // 任务结果事实 (纯目标为键 — 同目标重复执行只更新不新增, 供"继续/改进"检索)
+    const goal = userInput.replace(/\s+/g, " ").trim().slice(0, 80);
+    if (goal) {
+      this.upsert(`已完成: ${goal}`, "outcome");
+      changed = true;
+    }
+    return changed;
+  }
+
+  /** 关键词重叠检索 (轻量, 不依赖 embedding; CJK 用 2-gram 滑窗, 避免整词子串漏配) */
+  search(query: string, k: number = 4): Array<{ text: string; score: number }> {
+    if (this.facts.length === 0) return [];
+    const tokens = query.toLowerCase().split(/[\s,，。；;:：/\\.\-_/]+/).filter((t) => t.length > 1);
+    if (tokens.length === 0) return [];
+    const CJK = /[\u4e00-\u9fff]/;
+    const gramsOf = (tk: string): string[] => {
+      if (!CJK.test(tk) || tk.length < 2) return [tk];
+      const grams: string[] = [];
+      for (let i = 0; i < tk.length - 1; i++) grams.push(tk.slice(i, i + 2));
+      return grams;
+    };
+    const scored = this.facts.map((f) => {
+      const lower = f.text.toLowerCase();
+      let hits = 0;
+      for (const tk of tokens) {
+        if (lower.includes(tk) || gramsOf(tk).some((g) => lower.includes(g))) hits++;
+      }
+      return { text: f.text, score: hits / tokens.length, meta: f };
+    }).filter((s) => s.score > 0);
+    scored.sort((a, b) => (b.score * 1000 + b.meta.hits) - (a.score * 1000 + a.meta.hits));
+    return scored.slice(0, k).map(({ text, score }) => ({ text, score }));
+  }
+
+  toContext(query: string, k: number = 4): string {
+    const results = this.search(query, k);
+    if (results.length === 0) return "";
+    return "【项目记忆】\n" + results.map((r) => `  • ${r.text}`).join("\n");
+  }
+
+  async save(filePath: string): Promise<void> {
+    await writeJsonFile(filePath, { facts: this.facts });
+  }
+
+  async load(filePath: string): Promise<void> {
+    const data = await readJsonFile<{ facts?: ProjectFact[] }>(filePath, { facts: [] });
+    this.facts = (data.facts ?? []).filter((f) => f && typeof f.text === "string");
+  }
+}
+
+// ============================================================================
+// 6. MemorySystem — 编排器
 // ============================================================================
 
 const SUMMARIZE_PROMPT = `根据原始记忆提炼与当前问题相关的内容。
@@ -507,6 +653,7 @@ export class MemorySystem {
   private sem: SemanticMemory;
   private per: Persona;
   private imp: ImportantMemory;
+  private proj: ProjectMemory;
   private dataDir: string;
 
   /** 上下文稳定性 — 历史评分记录（key → 上轮得分） */
@@ -521,6 +668,7 @@ export class MemorySystem {
     this.sem = new SemanticMemory(config.embedFn);
     this.per = new Persona();
     this.imp = new ImportantMemory(30);
+    this.proj = new ProjectMemory(60);
     this.dataDir = config.dataDir;
   }
 
@@ -529,6 +677,12 @@ export class MemorySystem {
   get semantic() { return this.sem; }
   get persona() { return this.per; }
   get important() { return this.imp; }
+  get project() { return this.proj; }
+
+  /** 工程记忆跨会话持久 — 固定存 .TAI/ 根 (会话目录外的稳定位置) */
+  private projectMemoryPath(): string {
+    return path.resolve(process.env.TAICODE_CWD ?? process.cwd(), ".TAI", "project-memory.json");
+  }
 
   async initialize(): Promise<void> {
     await ensureDir(this.dataDir);
@@ -537,8 +691,9 @@ export class MemorySystem {
       this.sem.load(path.join(this.dataDir, "semanticmemory.json")),
       this.per.load(path.resolve(process.env.TAICODE_CWD ?? process.cwd(), ".TAI", "persona.json")),
       this.imp.load(path.join(this.dataDir, "importantmemory.json")),
+      this.proj.load(this.projectMemoryPath()),
     ]);
-    log.info(`记忆加载完成: 短期=${this.stm.count}条, 语义=${this.sem.count}条, 画像=${this.per.name ?? "(空)"}, 规则=${this.imp.count}条`);
+    log.info(`记忆加载完成: 短期=${this.stm.count}条, 语义=${this.sem.count}条, 画像=${this.per.name ?? "(空)"}, 规则=${this.imp.count}条, 项目=${this.proj.count}条`);
   }
 
   /** 写入管线 — 顺序执行，防止并发吞错误 */
@@ -638,6 +793,16 @@ export class MemorySystem {
     return `你是一个AI助手。\n\n关于当前对话，你可能需要了解以下信息：\n\n${summarized}`;
   }
 
+  /** 任务完成后由 Session 调用 — 记录工程事实到跨会话项目记忆 */
+  recordTaskOutcome(userInput: string, answer: string, files: string[] = []): boolean {
+    try {
+      return this.proj.recordTaskOutcome(userInput, answer, files);
+    } catch (e) {
+      log.warn("项目记忆写入失败:", (e as Error).message);
+      return false;
+    }
+  }
+
   async saveAll(): Promise<void> {
     await ensureDir(this.dataDir);
     await Promise.all([
@@ -645,8 +810,9 @@ export class MemorySystem {
       this.sem.save(path.join(this.dataDir, "semanticmemory.json")),
       this.per.save(path.resolve(process.env.TAICODE_CWD ?? process.cwd(), ".TAI", "persona.json")),
       this.imp.save(path.join(this.dataDir, "importantmemory.json")),
+      this.proj.save(this.projectMemoryPath()),
     ]);
-    log.info(`记忆保存: data/ (短:${this.stm.count} 语:${this.sem.count} 画:${this.per.name ?? "-"} 重:${this.imp.count})`);
+    log.info(`记忆保存: data/ (短:${this.stm.count} 语:${this.sem.count} 画:${this.per.name ?? "-"} 重:${this.imp.count} 项:${this.proj.count})`);
   }
 
   /**
@@ -705,6 +871,18 @@ export class MemorySystem {
       const isTask = /创建|删除|项目|代码|python|ts|js|文件夹/.test(r.text.toLowerCase());
       const weight = isTask ? 0.5 : 0.25; // 技术历史低权, 闲聊更低
       candidates.push({ text: r.text.slice(0, 200), score: Math.min(0.5, r.score * weight), key: `sem:${r.text.slice(0, 60)}`, category: "KNOWLEDGE", immortal: false });
+    }
+
+    // 项目记忆 — 工程事实 (技术栈/布局/既往任务结果), 任务查询时高权注入
+    for (const r of this.proj.search(query, 4)) {
+      const weight = isTaskQuery ? 0.85 : 0.5;
+      candidates.push({
+        text: r.text.slice(0, 200),
+        score: weight * (0.5 + r.score / 2),
+        key: `proj:${r.text.slice(0, 50)}`,
+        category: "KNOWLEDGE",
+        immortal: false,
+      });
     }
 
     // 画像

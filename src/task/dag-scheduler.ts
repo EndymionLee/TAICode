@@ -5,10 +5,13 @@ import * as os from "os";
 import type { SubTask } from "../core/types.js";
 import { createLogger } from "../core/logger.js";
 import { Semaphore } from "./semaphore.js";
-import { reactWorker, type WorkerResult } from "./worker.js";
+import { reactWorker, estimateWorkerBudgetMs, type WorkerResult } from "./worker.js";
+import { parseWorkerOutput } from "./worker-output.js";
 import { events } from "../core/events.js";
 import { safeJsonParse } from "../core/json-utils.js";
 import { getSandboxInstance } from "../core/tools/registry.js";
+import { extractFileRefKeys } from "../core/file-refs.js";
+import { buildInlineContext } from "./inline-context.js";
 import type { ErrorClassification } from "../core/types.js";
 
 const log = createLogger("task:dag");
@@ -17,6 +20,17 @@ const MAX_WORKERS = Math.min(8, os.cpus().length || 4);
 const workerSemaphore = new Semaphore(MAX_WORKERS);
 
 export { MAX_WORKERS, workerSemaphore };
+
+/**
+ * 单任务外层超时 — 按 Worker 内层预算推导 (修复内外超时打架:
+ * 内层 LLM 90s×3 重试最多 270s, 旧外层 120s 必然先杀, 重试全部白做)。
+ * 可用 TAICODE_TASK_TIMEOUT_MS 覆盖。
+ */
+const TASK_TIMEOUT_MS = (() => {
+  const env = Number(process.env.TAICODE_TASK_TIMEOUT_MS);
+  if (Number.isFinite(env) && env > 0) return env;
+  return Math.max(120_000, estimateWorkerBudgetMs());
+})();
 
 /** 找出所有依赖已满足的待执行任务 */
 function findReadyTasks(
@@ -108,14 +122,15 @@ export function mergeDependencies(
 export class DAGScheduler {
   async execute(
     tasks: SubTask[],
-    dependencies: Record<string, number[]>
+    dependencies: Record<string, number[]>,
+    opts: { sharedSpec?: string } = {},
   ): Promise<{
     tasks: SubTask[];
     completedTasks: number[];
     taskResults: Record<number, string>;
     taskLogs: Record<number, string[]>;
   }> {
-    log.info(`DAG 调度: ${tasks.length} 任务, 依赖: ${JSON.stringify(dependencies)}, Worker=${MAX_WORKERS}`);
+    log.info(`DAG 调度: ${tasks.length} 任务, 依赖: ${JSON.stringify(dependencies)}, Worker=${MAX_WORKERS}${opts.sharedSpec ? ", spec已注入" : ""}`);
     events.dag.start(tasks.length, MAX_WORKERS);
     // 重置预算，每批任务独立计数
     getSandboxInstance().reset();
@@ -124,8 +139,50 @@ export class DAGScheduler {
     const taskResults: Record<number, string> = {};
     const taskLogs: Record<number, string[]> = {};
     const running = new Map<number, Promise<WorkerResult>>();
+    // 一次性准备标记 — 前置 summary + 产物内联只在首次调度时注入。
+    // (重试会重跑 executeTask, 原版对 description 重复拼接"前置已完成",
+    //  P1-2 内联块最多 32KB 会把该缺陷放大成上下文污染 → WeakSet 根治)
+    const prepared = new WeakSet<object>();
+
+    /** 信号量 + 外层超时竞争 (主路径与重试快路径共用) */
+    const raceWithTimeout = async (task: SubTask, workerId: number): Promise<WorkerResult> => {
+      // 外层超时不再 reject (旧实现一次超时直接击穿 execute 主循环, 整图崩溃):
+      // 置 aborted 标记 → Worker 在步边界自行退出; race 解析为标准超时失败结果,
+      // 走统一的错误分类/重试通道。
+      let timedOut = false;
+      try {
+        return await Promise.race([
+          reactWorker(task, workerId, { shouldAbort: () => timedOut, sharedSpec: opts.sharedSpec }),
+          new Promise<WorkerResult>((resolve) => {
+            const timer = setTimeout(() => {
+              timedOut = true;
+              log.warn(`任务 #${task.id} 外层超时 (${TASK_TIMEOUT_MS / 1000}s), 标记中止`);
+              resolve({
+                taskId: task.id,
+                result: parseWorkerOutput(JSON.stringify({
+                  status: "failed",
+                  summary: `任务超时(${TASK_TIMEOUT_MS / 1000}s)`,
+                  created: [], deleted: [], modified: [],
+                  error: "任务超时",
+                }), task.description, task.id),
+                logs: [],
+                error: `任务超时(${TASK_TIMEOUT_MS / 1000}s)`,
+              });
+            }, TASK_TIMEOUT_MS);
+            timer.unref?.();
+          }),
+        ]);
+      } finally { workerSemaphore.release(); }
+    };
 
     const executeTask = async (task: SubTask, workerId: number): Promise<WorkerResult> => {
+      // 重试快路径: 已准备过的任务 (前置注入只做一次, 不重复拼接)
+      if (prepared.has(task)) {
+        events.task.start(task.id, task.description);
+        await workerSemaphore.acquire();
+        return raceWithTimeout(task, workerId);
+      }
+      prepared.add(task);
       // 只传直接依赖的 summary，不是全部结果
       const depIds = dependencies[String(task.id)] ?? [];
       if (depIds.length > 0) {
@@ -148,17 +205,19 @@ export class DAGScheduler {
           }
         }
         if (ctxParts.length) task.description = `${task.description}\n\n前置已完成:\n${ctxParts.join("\n")}`;
+        // P1-2 前置产物内联 — 下游直接拿上游产物内容, 省 read_file 一轮往返
+        // (拼在任务描述=首条 HumanMessage 尾部, 不破坏 system 共享前缀)
+        const depResults: Record<number, string> = {};
+        for (const did of depIds) { const r = taskResults[did]; if (r) depResults[did] = r; }
+        const inline = buildInlineContext(depResults);
+        if (inline) {
+          task.description += inline;
+          log.info(`任务 #${task.id} 内联 ${Object.keys(depResults).length} 个前置产物块`);
+        }
       }
       events.task.start(task.id, task.description);
       await workerSemaphore.acquire();
-      try {
-        return await Promise.race([
-          reactWorker(task, workerId),
-          new Promise<WorkerResult>((_, reject) =>
-            setTimeout(() => reject(new Error("任务超时(120s)")), 120_000)
-          ),
-        ]);
-      } finally { workerSemaphore.release(); }
+      return raceWithTimeout(task, workerId);
     };
 
     // 错误分类器 — 同一种失败不应重试
@@ -190,27 +249,47 @@ export class DAGScheduler {
     const MAX_RETRIES = 2;
 
     // 文件写锁：同文件同时只有一个 Worker 在写
+    // (unicode 健壮提取: 中文文件名/多级扩展名/路径 basename 均可命中)
     const fileLocks = new Set<string>();
 
     function lockFiles(task: SubTask): boolean {
-      // 从任务描述中提取文件名
-      const files = task.description.match(/([a-zA-Z0-9_-]+\.[a-z]{1,6})/gi) ?? [];
+      const files = extractFileRefKeys(task.description);
       for (const f of files) {
-        if (fileLocks.has(f.toLowerCase())) return false; // 文件被锁
+        if (fileLocks.has(f)) return false; // 文件被锁
       }
-      for (const f of files) fileLocks.add(f.toLowerCase());
+      for (const f of files) fileLocks.add(f);
       return true;
     }
 
     function unlockFiles(task: SubTask): void {
-      const files = task.description.match(/([a-zA-Z0-9_-]+\.[a-z]{1,6})/gi) ?? [];
-      for (const f of files) fileLocks.delete(f.toLowerCase());
+      for (const f of extractFileRefKeys(task.description)) fileLocks.delete(f);
     }
 
     while (true) {
       const ready = findReadyTasks(tasks, dependencies, completed);
       for (const task of ready) {
         if (running.has(task.id)) continue;
+
+        // P2-2: 依赖已终态失败 → 下游直接 skip-with-reason, 不执行注定失败的任务
+        // (blocked_on 契约字段一并记录在结果里; Validator/轻量重规划可据此补救)
+        const depIds0 = dependencies[String(task.id)] ?? [];
+        const failedDep = depIds0.map((d) => tasks.find((t) => t.id === d)).find((t) => t?.status === "failed");
+        if (failedDep) {
+          task.status = "failed";
+          task.result = JSON.stringify({
+            status: "failed",
+            summary: `前置任务 #${failedDep.id} 已终态失败, 跳过执行 (blocked_on: [${failedDep.id}])`,
+            created: [], deleted: [], modified: [],
+            blocked_on: [failedDep.id], confidence: 1,
+            error: "前置失败跳过",
+          });
+          completed.add(task.id);
+          taskResults[task.id] = task.result;
+          log.warn(`任务 #${task.id} 跳过: 前置 #${failedDep.id} 终态失败`);
+          events.task.fail(task.id, `前置 #${failedDep.id} 失败, 跳过`);
+          continue;
+        }
+
         if (!lockFiles(task)) continue; // 文件被占用，等下一轮
         const r = retries.get(task.id) ?? 0;
         if (r >= MAX_RETRIES) {

@@ -2,10 +2,10 @@
  * React Worker — 单个任务的 ReAct 循环 + 幻觉检测
  *
  * 进度检测: 文件系统快照 diff (唯一可信进度源)
- * 不再依赖日志 grep — 直接比较工具调用前后的文件系统状态
+ * 快照由 sharedSnapshotService 全局共享 + 增量维护 (fs.watch),
+ * 不再每个 Worker 每步全量扫描。
  */
 import * as fs from "fs";
-import * as path from "path";
 import {
   HumanMessage, AIMessage, SystemMessage, ToolMessage,
   type BaseMessage,
@@ -19,6 +19,14 @@ import { Semaphore } from "./semaphore.js";
 import { WORKER_SYSTEM_PROMPT } from "./prompts.js";
 import { events } from "../core/events.js";
 import { newTrace, newSpan, clearSpan, spanPrefix } from "../core/trace.js";
+import { sharedSnapshotService, countSnapshotDiff, type Snapshot } from "../core/snapshot-service.js";
+import { extractFileRefs } from "../core/file-refs.js";
+import { parseWorkerOutput } from "./worker-output.js";
+import { recordAIMessage } from "../core/llm/cache-telemetry.js";
+import { quickLint } from "./quick-lint.js";
+import { truncateToolResult, foldMessages } from "./context-fold.js";
+
+export { parseWorkerOutput } from "./worker-output.js";
 
 // ============================================================================
 // Worker 配置
@@ -26,6 +34,23 @@ import { newTrace, newSpan, clearSpan, spanPrefix } from "../core/trace.js";
 
 export const MAX_LLM_CONCURRENCY = 5;
 export const llmSemaphore = new Semaphore(MAX_LLM_CONCURRENCY);
+
+// ============================================================================
+// 超时预算 — 对外导出, DAG 外层超时据此推导 (修复内外超时打架)
+// ============================================================================
+
+export const LLM_TIMEOUT_MS = 90_000;
+export const MAX_LLM_RETRIES = 3;
+/** 工具执行/心跳留量 */
+const GRACE_MS = 90_000;
+
+/**
+ * Worker 最坏情况内层预算: LLM 重试全部用满 + 一次工具执行留量。
+ * DAG 外层超时必须 ≥ 此值, 否则外层必然先杀, 内层重试全部白做。
+ */
+export function estimateWorkerBudgetMs(): number {
+  return LLM_TIMEOUT_MS * MAX_LLM_RETRIES + GRACE_MS;
+}
 
 // ============================================================================
 // 幻觉检测
@@ -68,59 +93,6 @@ function validateWorkerResult(task: SubTask, logs: string[]): string | null {
 }
 
 // ============================================================================
-// 文件系统快照 — 以真实文件变更为唯一可信进度源
-// ============================================================================
-
-const SKIP_DIRS = new Set([
-  ".git", "node_modules", "__pycache__", ".venv", ".TAI",
-  ".idea", ".vscode", "dist", "build", ".next", ".nuxt",
-  "coverage", ".cache",
-]);
-
-interface FileEntry { mtime: number; size: number; }
-type Snapshot = Record<string, FileEntry>;
-
-async function takeSnapshot(root: string): Promise<Snapshot> {
-  const snap: Snapshot = {};
-  const stack: string[] = [root];
-  let fileCount = 0;
-  const MAX_FILES = 5000;
-  while (stack.length > 0 && fileCount < MAX_FILES) {
-    const dir = stack.pop()!;
-    let entries: fs.Dirent[];
-    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); }
-    catch { continue; }
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        if (!SKIP_DIRS.has(entry.name)) stack.push(path.join(dir, entry.name));
-      } else if (entry.isFile()) {
-        const fullPath = path.join(dir, entry.name);
-        try {
-          const stat = await fs.promises.stat(fullPath);
-          snap[fullPath.replace(/\\/g, "/")] = { mtime: stat.mtimeMs, size: stat.size };
-          fileCount++;
-        } catch { /* 文件在读前被删 */ }
-      }
-    }
-  }
-  return snap;
-}
-
-function countSnapshotDiff(before: Snapshot, after: Snapshot): number {
-  let changes = 0;
-  // 新增/修改
-  for (const [fp, info] of Object.entries(after)) {
-    const prev = before[fp];
-    if (!prev || prev.mtime !== info.mtime || prev.size !== info.size) changes++;
-  }
-  // 删除
-  for (const fp of Object.keys(before)) {
-    if (!after[fp]) changes++;
-  }
-  return changes;
-}
-
-// ============================================================================
 // React Worker
 // ============================================================================
 
@@ -131,64 +103,22 @@ export interface WorkerResult {
   error: string | null;
 }
 
-/** Worker 输出标准化 — JSON parse 失败时返回 error JSON，永不透传 raw text */
-function parseWorkerOutput(result: string, taskDesc?: string, taskId?: number): string {
-  // 标准 JSON 结构
-  const errorOutput = (reason: string): string => JSON.stringify({
-    status: "failed",
-    summary: `Worker 输出格式错误: ${reason}`,
-    cwd: "",
-    created: [], deleted: [], modified: [], read: [],
-    error: "输出格式错误",
-    task_id: taskId,
-  });
-
-  // 尝试提取 JSON（markdown fence + brace counting）
-  const extracted = extractJson(result);
-  const json = extracted || result;
-
-  let parsed: any;
-  try { parsed = JSON.parse(json); }
-  catch {
-    // JSON 解析失败 → 标准化 error，不透传
-    return errorOutput(`无法解析为 JSON: ${result.slice(0, 100)}`);
-  }
-
-  // 字段补全
-  if (taskId !== undefined) parsed.task_id = taskId;
-  if (!parsed.cwd) {
-    const firstPath = (parsed.created ?? []).concat(parsed.deleted ?? [], parsed.modified ?? [])[0];
-    if (firstPath) parsed.cwd = firstPath.replace(/[/\\][^/\\]*$/, "");
-    else if (taskDesc) {
-      const m = taskDesc.match(/([A-Z]:\\[^\s，,\\]*)/i);
-      parsed.cwd = m ? m[1] : "";
-    } else {
-      parsed.cwd = "";
-    }
-  }
-  // 确保必需字段存在 + 常见拼写容错
-  parsed.status = parsed.status || "failed";
-  parsed.summary = typeof parsed.summary === "string" ? parsed.summary
-    : typeof parsed.sumary === "string" ? parsed.sumary  // LLM 常见 typo
-    : "";
-  parsed.created = parsed.created || [];
-  parsed.deleted = parsed.deleted || [];
-  parsed.modified = parsed.modified || [];
-  parsed.read = parsed.read || [];
-  parsed.error = parsed.error || null;
-
-  // 硬截断 summary
-  if (parsed.summary.length > 120) {
-    parsed.summary = parsed.summary.slice(0, 120) + "...";
-  }
-
-  return JSON.stringify(parsed);
+export interface WorkerOptions {
+  /** 外层超时/DAG 取消时置 true, Worker 在当前步边界尽快退出 (而非被外层 race 遗弃后空转) */
+  shouldAbort?: () => boolean;
+  /**
+   * 共享规格块 — 所有 Worker 字节级一致, 拼在 system 尾部固定位置:
+   * ① 延长跨 Worker 的公共前缀 (DeepSeek 前缀缓存命中 ~1/10 价)
+   * ② 省去每个 Worker read_file 读 spec.json 的一次工具往返
+   */
+  sharedSpec?: string;
 }
 
 /** React Worker: 执行单个任务的完整 ReAct 循环 */
 export async function reactWorker(
   task: SubTask,
   workerId: number,
+  opts: WorkerOptions = {},
 ): Promise<WorkerResult> {
   const tid = task.id;
   const desc = task.description;
@@ -213,11 +143,12 @@ export async function reactWorker(
   const complexity = /cnn|transformer|train|model|网络|训练|模型/i.test(desc) ? 3
     : /class |函数|function|算法|algorithm/i.test(desc) ? 2
     : 1;
-  const fileCount = (desc.match(/[a-zA-Z0-9_-]+\.[a-z]{1,6}/gi) ?? []).length || 1;
+  const fileCount = extractFileRefs(desc).length || 1;
   let maxSteps = Math.min(60, 20 + fileCount * 5 + complexity * 10);
 
   const messages: BaseMessage[] = [
-    new SystemMessage(WORKER_SYSTEM_PROMPT),
+    // system = 冻结规则层 + 共享规格层 (全 Worker 字节一致 → 前缀缓存跨 Worker 命中)
+    new SystemMessage(WORKER_SYSTEM_PROMPT + (opts.sharedSpec ?? "")),
     new HumanMessage(taskPrompt),
   ];
 
@@ -225,6 +156,11 @@ export async function reactWorker(
   let lastError = "";
   let sameErrorCount = 0;
   let noProgressSteps = 0;
+
+  // P1-3 验证前移 — 本 Worker 触碰的文件 + 自修复轮次
+  const touchedFiles = new Set<string>();
+  let lintFixRounds = 0;
+  const TOUCH_TOOLS = new Set(["write_file", "sed", "mv", "cp", "mkdir"]);
 
   // 四层活动/死循环检测
   let lastToolKey = "";           // "toolName:argsHash"
@@ -234,18 +170,13 @@ export async function reactWorker(
   let repeatResponseCount = 0;
   const MAX_REPEAT_RESPONSE = 3;  // 相同 LLM 输出 ×3 → 思考循环
 
-  // 工作区路径 + 初始快照
+  // 工作区路径 + 共享快照 (全局单例增量维护, 非每 Worker 全量扫描)
   const WORKSPACE_DIR = (process.env.TAICODE_CWD ?? process.cwd()).replace(/\\/g, "/");
-  workerLog.info(`快照: 开始扫描 ${WORKSPACE_DIR}`);
   let lastSnapshot: Snapshot;
   try {
-    lastSnapshot = await Promise.race([
-      takeSnapshot(WORKSPACE_DIR),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("快照超时(30s)")), 30_000)
-      ),
-    ]);
-    workerLog.info(`快照: 完成, ${Object.keys(lastSnapshot).length} 个文件`);
+    await sharedSnapshotService.acquire(WORKSPACE_DIR);
+    lastSnapshot = await sharedSnapshotService.getSnapshot();
+    workerLog.info(`快照(共享): ${Object.keys(lastSnapshot).length} 个文件`);
   } catch (e) {
     workerLog.warn(`快照失败: ${(e as Error).message}，使用空快照`);
     lastSnapshot = {};
@@ -260,10 +191,27 @@ export async function reactWorker(
 
   try {
   for (var step = 0; step < maxSteps; step++) {
+    // 外层超时/取消 → 步边界尽快退出 (不再被 Promise.race 遗弃后空转)
+    if (opts.shouldAbort?.()) {
+      workerLog.warn(`worker 退出: reason=外层中止 step=${step}/${maxSteps}`);
+      return { taskId: tid, result: parseWorkerOutput(JSON.stringify({
+        status: "failed",
+        summary: `外层超时中止 (step=${step}/${maxSteps})`,
+        created: [], deleted: [], modified: [],
+        error: "外层超时中止",
+      }), desc, tid), logs, error: "外层超时中止" };
+    }
     // 步数快用完 + 有进度 → 自动续
     if (step >= maxSteps - 3 && maxSteps < 100 && noProgressSteps < 3) {
       maxSteps += 15;
       workerLog.info(`步数自动续期 +15 → ${maxSteps}`);
+    }
+
+    // P2-3 上下文预算: 消息超限折叠中段旧工具结果 (保持追加结构, 不删消息)
+    if (messages.length > 40) {
+      const folded = foldMessages(messages);
+      messages.length = 0;
+      messages.push(...folded);
     }
 
     // 每步一个 span — 关联本步内所有日志/工具调用
@@ -272,8 +220,7 @@ export async function reactWorker(
 
     // LLM 调用 (带重试 + 限流 + 90s 超时)
     let response: AIMessage | null = null;
-    const LLM_TIMEOUT_MS = 90_000;
-    for (let retry = 0; retry < 3; retry++) {
+    for (let retry = 0; retry < MAX_LLM_RETRIES; retry++) {
       try {
         await llmSemaphore.acquire();
         try {
@@ -298,6 +245,7 @@ export async function reactWorker(
     }
 
     if (!response) return { taskId: tid, result: parseWorkerOutput("", desc, tid), logs, error: "LLM 响应为空" };
+    recordAIMessage(response, `worker-${workerId}`);
     messages.push(response);
 
     // 🔧 重复回复检测 — LLM 连续输出相同内容 ×3 → 思考循环
@@ -329,6 +277,21 @@ export async function reactWorker(
       if (!toolsCalled && taskNeedsTools(desc)) {
         return { taskId: tid, result: parseWorkerOutput(response.content as string || "", desc, tid), logs, error: "幻觉: 未调用工具" };
       }
+
+      // P1-3 验证前移 — 代码层强制语法检查(py_compile/node --check/tsc),
+      // 失败注入系统反馈同循环自修复 (≤2轮), 免走一轮 DAG 重试调度
+      if (lintFixRounds < 2 && touchedFiles.size > 0) {
+        const lintErr = await quickLint([...touchedFiles]);
+        if (lintErr) {
+          lintFixRounds++;
+          logs.push(`[Worker-${workerId}] 快速验证失败 (${lintFixRounds}/2): ${lintErr.slice(0, 200)}`);
+          workerLog.warn(`验证前移: 语法错误, 注入反馈自修复 (${lintFixRounds}/2)`);
+          messages.push(new HumanMessage(`[系统验证反馈] 你产出的文件存在语法错误, 请立即用工具修复后重新输出结果 JSON:\n${lintErr}`));
+          continue;
+        }
+        logs.push(`[Worker-${workerId}] 快速验证通过 (${touchedFiles.size} 文件)`);
+      }
+
       logs.push(`[Worker-${workerId}] 任务 #${tid} 完成 (${step + 1} 步)`);
       const validationError = validateWorkerResult(task, logs);
       if (validationError) {
@@ -371,6 +334,12 @@ export async function reactWorker(
       try {
         const tool = allTools.find((t: any) => t.name === toolName);
         if (tool) {
+          // 收集触碰文件 (验证前移用; write_file/sed 用 path, mv/cp 用 target)
+          if (TOUCH_TOOLS.has(toolName)) {
+            const a = args as any;
+            const p = a?.path ?? a?.target ?? a?.dest;
+            if (typeof p === "string" && p) touchedFiles.add(String(p));
+          }
           const result = await tool.execute(args);
           logs.push(`[Worker-${workerId}] 工具结果: ${result.slice(0, 200)}`);
           if (/ImportError|SyntaxError|ModuleNotFoundError|IndentationError/i.test(result)) {
@@ -384,7 +353,7 @@ export async function reactWorker(
               sameErrorCount = 1;
             }
           }
-          messages.push(new ToolMessage({ content: result, tool_call_id: tc.id!, name: toolName }));
+          messages.push(new ToolMessage({ content: truncateToolResult(result), tool_call_id: tc.id!, name: toolName }));
         } else {
           logs.push(`[Worker-${workerId}] 未知工具: ${toolName}`);
           messages.push(new ToolMessage({ content: `未知工具: ${toolName}`, tool_call_id: tc.id!, name: toolName }));
@@ -409,7 +378,7 @@ export async function reactWorker(
     //   √ 阈值 20 步（给复杂任务留足思考空间）
     //   √ DAG 120s 超时作为最终兜底
     // ======================================================================
-    const currentSnapshot = await takeSnapshot(WORKSPACE_DIR);
+    const currentSnapshot = await sharedSnapshotService.getSnapshot();
     const fileChanges = countSnapshotDiff(lastSnapshot, currentSnapshot);
     // 工具调用本身即是活动信号 — LLM 在做事
     const hadToolCalls = response.tool_calls && response.tool_calls.length > 0;
@@ -453,5 +422,6 @@ export async function reactWorker(
   }), desc, tid), logs, error: failureDiagnosis };
   } finally {
     clearInterval(heartbeat);
+    await sharedSnapshotService.release().catch(() => {});
   }
 }

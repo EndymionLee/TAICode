@@ -16,6 +16,8 @@ import { toolsList, loadMCPTools, stopMCP } from "../core/tools/registry.js";
 import { events } from "../core/events.js";
 import { TASK_GATE_PROMPT } from "../task/prompts.js";
 import { createLogger } from "../core/logger.js";
+import { extractFileRefs } from "../core/file-refs.js";
+import { resetCacheTelemetry, logCacheReport } from "../core/llm/cache-telemetry.js";
 
 const log = createLogger("runtime");
 const CWD = process.env.TAICODE_CWD ?? process.cwd();
@@ -28,6 +30,17 @@ function makeSessionDir(): string {
   const dir = path.join(SESSIONS_DIR, ts);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+/** 输出本轮缓存命中报告并落 jsonl (跨会话分析) */
+function emitCacheReport(tag: string): void {
+  try {
+    const r = logCacheReport(`缓存命中 ${tag}`);
+    const taiDir = DATA_DIR;
+    if (!fs.existsSync(taiDir)) fs.mkdirSync(taiDir, { recursive: true });
+    fs.appendFileSync(path.join(taiDir, "cache-stats.jsonl"),
+      JSON.stringify({ ts: new Date().toISOString(), tag, ...r }) + "\n", "utf-8");
+  } catch { /* ignore */ }
 }
 
 const CHAT_SYSTEM_PROMPT = `你是 TAICode，一个 AI 编程助手。
@@ -60,6 +73,8 @@ function isArticleRequest(input: string): boolean {
 export class Session {
   private chatLLM = createLLMClient({ temperature: 0.7 });
   private summaryLLM = createLLMClient({ temperature: 0 });
+  /** Gate 分类专用 — LLM_GATE_MODEL 可配便宜档 (缺省回落主模型) */
+  private gateLLM = createLLMClient({ model: process.env.LLM_GATE_MODEL || undefined, temperature: 0 });
   private memory!: MemorySystem;
   private turnCount = 0;
   private initialized = false;
@@ -71,7 +86,7 @@ export class Session {
   async init(): Promise<void> {
     if (this.initialized) return;
     log.info("══════════════ TAICode 启动 ══════════════");
-    log.info(`模型: ${this.chatLLM.modelName} · CWD: ${process.cwd()}`);
+    log.info(`模型: ${this.chatLLM.modelName} · Gate: ${this.gateLLM.modelName}${this.gateLLM.modelName !== this.chatLLM.modelName ? " (分级)" : ""} · CWD: ${process.cwd()}`);
     const embedFn = async (text: string): Promise<number[] | null> => {
       try { const r = await this.summaryLLM.embed(text); return r?.[0]?.length > 0 ? r[0] : null; }
       catch { return null; }
@@ -95,13 +110,14 @@ export class Session {
   /** 处理用户输入, 返回 AI 回复。仅 emit 事件, 不接触终端。 */
   async ask(userInput: string): Promise<string> {
     events.chat.user(userInput);  // 必须在 LLM 调用之前, 确保 UI 先显示用户消息
+    resetCacheTelemetry(); // 每轮独立统计缓存命中 (chat 流式无 usage, 主要覆盖 task 管线)
     const context = await this.memory.compileContext(userInput);
     log.info(`对话 #${this.turnCount + 1}: lastWasTask=${this._lastWasTask}`);
 
     let response = "";
 
-    // LLM 一次性三分类：chat / simple_task / complex_task
-    const gateResult = await this.chatLLM.chat(
+    // LLM 一次性三分类：chat / simple_task / complex_task (分级模型, 省主档调用)
+    const gateResult = await this.gateLLM.chat(
       [{ role: "user", content: TASK_GATE_PROMPT.replace("{userInput}", userInput).replace("{history}", context) } as any],
       { temperature: 0 }
     );
@@ -118,7 +134,12 @@ export class Session {
       events.chat.assistant(response);
       events.task.result(response, Date.now() - startTime);
       this._lastWasTask = true;
+      // 任务回合也进记忆 — 旧代码任务路径完全绕过 memory.process, 任务对话不留痕;
+      // 工程事实 (技术栈/布局/结果) 落跨会话项目记忆, 后续"继续/改进"类请求可检索
+      void this.memory.process(userInput, response).catch(() => {});
+      this.memory.recordTaskOutcome(userInput, response, extractFileRefs(response));
       this.turnCount++;
+      emitCacheReport(`task: ${userInput.slice(0, 30)}`);
       return response;
     }
     {
@@ -231,6 +252,7 @@ export class Session {
 
     await this.memory.process(userInput, response);
     this.turnCount++;
+    emitCacheReport(`chat: ${userInput.slice(0, 30)}`);
     if (this.turnCount % AUTO_SAVE_INTERVAL === 0) await this.save();
     return response;
   }

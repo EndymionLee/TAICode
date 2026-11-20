@@ -36,3 +36,7 @@ ProjectRecord/process-records/
 
 # 环境变量（含 API Key）
 .env
+.e2e/
+scripts/tui-preview.txt
+scripts/tui-live.txt
+scripts/tui-live-task.txt
